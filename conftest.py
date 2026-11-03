@@ -348,3 +348,21 @@ def service(mock_spond_client):
 def service_only_emma(mock_spond_client):
     """SpondService with KIDS_CONFIG limiting the kids to Emma."""
     return SpondService(client=mock_spond_client, kids_config=["Emma"])
+
+
+@pytest.fixture
+def make_client(monkeypatch):
+    """Start the app (with lifespan) for a given auth token and settings environment."""
+    from starlette.testclient import TestClient
+
+    import main
+    from settings import Settings
+
+    def make(token: str, env: dict | None = None, config_token: str = ""):
+        monkeypatch.setattr(main, "AUTH_TOKEN", token)
+        monkeypatch.setattr(main, "CONFIG_TOKEN", config_token)
+        monkeypatch.setattr(main, "settings", Settings({"DATA_DIR": "", **(env or {})}))
+        monkeypatch.setattr(main, "service", None)
+        return TestClient(main.app, raise_server_exceptions=False)
+
+    return make

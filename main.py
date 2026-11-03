@@ -1,5 +1,17 @@
-"""Spond MCP server entry point — Starlette app with health + Streamable HTTP endpoints."""
+"""Spond MCP server entry point — Starlette app with health, settings and Streamable HTTP endpoints.
 
+The gateway contract (https://github.com/Olsenius/mcp-gateway):
+
+  POST /mcp                Streamable HTTP MCP, Bearer MCP_AUTH_TOKEN
+  GET  /healthz            liveness, no auth
+  GET  /healthz?check=1    logs in to Spond with the current settings, Bearer CONFIG_TOKEN
+  GET  /config             settings schema and values (never secrets), Bearer CONFIG_TOKEN
+  POST /config             {"values": {"ENV_NAME": "value"}, "clear": ["ENV_NAME"]}
+
+CONFIG_TOKEN defaults to MCP_AUTH_TOKEN.
+"""
+
+import asyncio
 import contextlib
 import hmac
 import json
@@ -21,28 +33,30 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+import telemetry
 from server import TOOLS, WRITE_TOOLS, SpondService, handle_tool_call
+from settings import Settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("spond-mcp")
 
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+CONFIG_TOKEN = os.environ.get("CONFIG_TOKEN", "")
+MAX_CONFIG_BODY = 64 * 1024
+TOOL_NAMES = {t["name"] for t in TOOLS}
 
-
-def parse_bool(name: str, value: str) -> bool:
-    v = value.strip().lower()
-    if v in ("", "0", "false", "no", "off"):
-        return False
-    if v in ("1", "true", "yes", "on"):
-        return True
-    raise ValueError(f"{name} must be a boolean")
-
-
-# Read-only hides and refuses the tools that change data in Spond.
-READ_ONLY = parse_bool("MCP_READ_ONLY", os.environ.get("MCP_READ_ONLY", ""))
-
+settings = Settings()
 service: SpondService | None = None
+service_lock = asyncio.Lock()
 session_manager: StreamableHTTPSessionManager | None = None
+
+
+def config_token() -> str:
+    return CONFIG_TOKEN or AUTH_TOKEN
+
+
+def needs_config_token(request: Request) -> bool:
+    return request.url.path == "/config" or (request.url.path == "/healthz" and "check" in request.query_params)
 
 
 def is_public(request: Request) -> bool:
@@ -52,14 +66,24 @@ def is_public(request: Request) -> bool:
     return request.url.path == "/healthz" and "check" not in request.query_params
 
 
+def authorized(request: Request, token: str) -> bool:
+    auth = request.headers.get("authorization", "")
+    return auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], token)
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Validate Bearer token on all requests except liveness probes."""
+    """Validate the Bearer token on all requests except liveness probes."""
 
     async def dispatch(self, request: Request, call_next):
-        if is_public(request) or not AUTH_TOKEN:
+        if is_public(request):
             return await call_next(request)
-        auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], AUTH_TOKEN):
+        if request.url.path == "/config" and not config_token():
+            # Without a token anyone could change the account; keep the settings API off.
+            return PlainTextResponse("not found", status_code=404)
+        token = config_token() if needs_config_token(request) else AUTH_TOKEN
+        if not token:
+            return await call_next(request)
+        if not authorized(request, token):
             logger.warning(
                 "Unauthorized request to %s from %s",
                 request.url.path,
@@ -70,16 +94,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 def create_service() -> SpondService:
-    username = os.environ.get("SPOND_USERNAME", "")
-    password = os.environ.get("SPOND_PASSWORD", "")
-    kids_json = os.environ.get("KIDS_CONFIG", "[]")
-
-    if not username or not password:
+    if not settings.configured:
         logger.warning("SPOND_USERNAME/SPOND_PASSWORD not set — API calls will fail")
-
-    kids_config = json.loads(kids_json)
-    client = Spond(username=username, password=password)
-    return SpondService(client=client, kids_config=kids_config)
+    client = Spond(username=settings.username, password=settings.password)
+    return SpondService(client=client, kids_config=settings.kids)
 
 
 def get_service() -> SpondService:
@@ -89,28 +107,41 @@ def get_service() -> SpondService:
     return service
 
 
+async def reset_service() -> None:
+    """Apply new settings without a restart: the next call logs in again."""
+    global service
+    async with service_lock:
+        old, service = service, None
+    if old is not None:
+        await old.close()
+
+
 # MCP server setup
 mcp_server = Server("spond")
 
 
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [Tool(**t) for t in TOOLS if not (READ_ONLY and t["name"] in WRITE_TOOLS)]
+    return [Tool(**t) for t in TOOLS if not (settings.read_only and t["name"] in WRITE_TOOLS)]
 
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
-    if READ_ONLY and name in WRITE_TOOLS:
-        return [TextContent(type="text", text=f"{name} er slått av (MCP_READ_ONLY).")]
-    try:
-        result = await handle_tool_call(get_service(), name, arguments)
-    except AuthenticationError:
-        # The error message holds Spond's raw login response; keep it out of logs and answers.
-        logger.error("Tool %s failed: Spond login failed", name)
-        result = "Feil: innlogging til Spond feilet. Sjekk SPOND_USERNAME og SPOND_PASSWORD."
-    except Exception as e:
-        logger.exception("Tool %s failed", name)
-        result = f"Feil: {e}"
+    label = name if name in TOOL_NAMES else "unknown"
+    with telemetry.span(f"tool {label}", attributes={"mcp.tool.name": label}) as current:
+        if settings.read_only and name in WRITE_TOOLS:
+            return [TextContent(type="text", text=f"{name} er slått av (MCP_READ_ONLY).")]
+        try:
+            result = await handle_tool_call(get_service(), name, arguments)
+        except AuthenticationError as e:
+            # The error message holds Spond's raw login response; keep it out of logs and answers.
+            telemetry.mark_error(current, e)
+            logger.error("Tool %s failed: Spond login failed", label)
+            result = "Feil: innlogging til Spond feilet. Sjekk SPOND_USERNAME og SPOND_PASSWORD."
+        except Exception as e:
+            telemetry.mark_error(current, e)
+            logger.exception("Tool %s failed", label)
+            result = f"Feil: {e}"
     return [TextContent(type="text", text=result)]
 
 
@@ -124,6 +155,11 @@ class MCPEndpoint:
         await session_manager.handle_request(scope, receive, send)
 
 
+def no_store(response):
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 async def health(request: Request):
     return PlainTextResponse("ok")
 
@@ -132,8 +168,9 @@ async def healthz(request: Request):
     if "check" not in request.query_params:
         return PlainTextResponse("ok")
     checks = []
-    if not os.environ.get("SPOND_USERNAME") or not os.environ.get("SPOND_PASSWORD"):
+    if not settings.configured:
         checks.append({"name": "Login", "ok": False, "detail": "SPOND_USERNAME and SPOND_PASSWORD must be set"})
+        status = "not configured"
     else:
         try:
             groups = await get_service().get_groups()
@@ -142,9 +179,32 @@ async def healthz(request: Request):
             # The Spond library puts the raw login response in its errors; keep it out of logs and answers.
             logger.error("Health check failed: %s", type(e).__name__)
             checks.append({"name": "Login", "ok": False, "detail": "could not log in to Spond"})
+        status = "ok" if checks[0]["ok"] else "failing"
     ok = all(c["ok"] for c in checks)
-    body = {"ok": ok, "status": "ok" if ok else "error", "checks": checks}
-    return JSONResponse(body, status_code=200 if ok else 503)
+    return no_store(JSONResponse({"ok": ok, "status": status, "checks": checks}, status_code=200 if ok else 503))
+
+
+async def config(request: Request):
+    if request.method == "GET":
+        return no_store(JSONResponse(settings.doc()))
+    body = await request.body()
+    if len(body) > MAX_CONFIG_BODY:
+        return no_store(JSONResponse({"error": "request body too large"}, status_code=413))
+    try:
+        update = json.loads(body or b"{}")
+        if not isinstance(update, dict):
+            raise ValueError('expected {"values": {...}, "clear": [...]}')
+        settings.update(update.get("values") or {}, update.get("clear") or [])
+    except json.JSONDecodeError:
+        return no_store(JSONResponse({"error": "invalid JSON"}, status_code=400))
+    except ValueError as e:
+        return no_store(JSONResponse({"error": str(e)}, status_code=400))
+    except OSError as e:
+        logger.error("Could not save settings: %s", type(e).__name__)
+        return no_store(JSONResponse({"error": "could not save settings"}, status_code=500))
+    await reset_service()
+    logger.info("settings updated via /config")
+    return no_store(JSONResponse(settings.doc()))
 
 
 @contextlib.asynccontextmanager
@@ -157,25 +217,29 @@ async def lifespan(app) -> AsyncIterator[None]:
             yield
         finally:
             session_manager = None
-            if service is not None:
-                await service.close()
+            await reset_service()
 
 
 app = Starlette(
     routes=[
         Route("/health", health),
         Route("/healthz", healthz),
+        Route("/config", config, methods=["GET", "POST"]),
         Route("/mcp", MCPEndpoint(), methods=["GET", "POST", "DELETE"]),
     ],
-    middleware=[Middleware(BearerAuthMiddleware)],
+    middleware=[Middleware(telemetry.TraceHTTP), Middleware(BearerAuthMiddleware)],
     lifespan=lifespan,
 )
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
+    shutdown = telemetry.configure()
     if AUTH_TOKEN:
-        logger.info("spond MCP server starting on :%d (auth enabled, read-only=%s)", port, READ_ONLY)
+        logger.info("spond MCP server starting on :%d (auth enabled, read-only=%s)", port, settings.read_only)
     else:
         logger.warning("spond MCP server starting on :%d (NO AUTH — set MCP_AUTH_TOKEN)", port)
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", http="h11")
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", http="h11")
+    finally:
+        shutdown()

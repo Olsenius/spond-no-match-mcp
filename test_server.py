@@ -23,6 +23,7 @@ from server import (
     norwegian_weekday,
     parse_timestamp,
 )
+from settings import Settings
 
 # --- Utility functions ---
 
@@ -837,20 +838,6 @@ MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": 
 AUTH = {"Authorization": "Bearer test-secret-token"}
 
 
-@pytest.fixture
-def make_client(monkeypatch):
-    """Start the app (with lifespan) for a given auth token."""
-    from starlette.testclient import TestClient
-
-    import main
-
-    def make(token: str):
-        monkeypatch.setattr(main, "AUTH_TOKEN", token)
-        return TestClient(main.app, raise_server_exceptions=False)
-
-    return make
-
-
 class TestBearerAuth:
     @pytest.fixture
     def client(self, make_client):
@@ -919,9 +906,8 @@ class TestBearerAuthDisabled:
 
 class TestReadOnly:
     @pytest.fixture
-    def client(self, make_client, monkeypatch):
-        monkeypatch.setattr("main.READ_ONLY", True)
-        with make_client("") as c:
+    def client(self, make_client):
+        with make_client("", {"MCP_READ_ONLY": "true"}) as c:
             yield c
 
     def _call(self, client, body):
@@ -948,15 +934,18 @@ class TestReadOnly:
 
     @pytest.mark.parametrize("value,expected", [("", False), ("false", False), ("true", True), ("1", True)])
     def test_parse_bool(self, value, expected):
-        from main import parse_bool
+        from settings import parse_bool
 
         assert parse_bool("X", value) is expected
 
     def test_parse_bool_rejects_garbage(self):
-        from main import parse_bool
+        from settings import parse_bool
 
         with pytest.raises(ValueError, match="must be a boolean"):
             parse_bool("MCP_READ_ONLY", "kanskje")
+
+
+CREDENTIALS = {"SPOND_USERNAME": "user@example.com", "SPOND_PASSWORD": "synthetic", "DATA_DIR": ""}
 
 
 class TestHealthCheck:
@@ -965,24 +954,20 @@ class TestHealthCheck:
         with make_client("") as c:
             yield c
 
-    def test_missing_credentials(self, client, monkeypatch):
-        monkeypatch.delenv("SPOND_USERNAME", raising=False)
-        monkeypatch.delenv("SPOND_PASSWORD", raising=False)
+    def test_missing_credentials(self, client):
         resp = client.get("/healthz?check=1")
         assert resp.status_code == 503
         assert resp.json()["ok"] is False
 
     def test_login_ok(self, client, monkeypatch, service):
-        monkeypatch.setenv("SPOND_USERNAME", "user@example.com")
-        monkeypatch.setenv("SPOND_PASSWORD", "synthetic")
+        monkeypatch.setattr("main.settings", Settings(CREDENTIALS))
         monkeypatch.setattr("main.service", service)
         resp = client.get("/healthz?check=1")
         assert resp.status_code == 200
         assert resp.json()["checks"][0] == {"name": "Login", "ok": True, "detail": "logged in, 3 groups"}
 
     def test_login_failure_hides_details(self, client, monkeypatch, service):
-        monkeypatch.setenv("SPOND_USERNAME", "user@example.com")
-        monkeypatch.setenv("SPOND_PASSWORD", "synthetic")
+        monkeypatch.setattr("main.settings", Settings(CREDENTIALS))
         service._client.get_groups.side_effect = RuntimeError("Login failed. Response received: secret")
         monkeypatch.setattr("main.service", service)
         resp = client.get("/healthz?check=1")

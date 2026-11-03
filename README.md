@@ -53,22 +53,32 @@ The server starts on port 8080:
 
 ```bash
 docker build -t spond-mcp .
-docker run -p 8080:8080 \
-  -e SPOND_USERNAME=you@example.com \
-  -e SPOND_PASSWORD=your-password \
+docker run -p 8080:8080 -v spond-data:/data \
+  -e MCP_AUTH_TOKEN=my-secret-token \
   spond-mcp
 ```
 
+The image has a Docker `HEALTHCHECK` on `/healthz` and keeps saved settings in the
+`/data` volume. It also runs with `--read-only`.
+
 ### Environment Variables
 
-| Variable         | Required | Default                 | Description                                       |
-| ---------------- | -------- | ----------------------- | ------------------------------------------------- |
-| `SPOND_USERNAME` | Yes      |                         | Spond account email                               |
-| `SPOND_PASSWORD` | Yes      |                         | Spond account password                            |
-| `KIDS_CONFIG`    | No       | `[]`                    | JSON array of first names, to limit which kids are used |
-| `MCP_AUTH_TOKEN` | No       |                         | Bearer token for authentication (see below)       |
-| `MCP_READ_ONLY`  | No       | `false`                 | `true` hides and refuses `respond_to_event`       |
-| `PORT`           | No       | `8080`                  | Server port                                       |
+| Variable         | On settings page | Default | Description |
+| ---------------- | ---------------- | ------- | ----------- |
+| `SPOND_USERNAME` | yes | | Spond account email |
+| `SPOND_PASSWORD` | yes | | Spond account password (never returned) |
+| `KIDS_CONFIG`    | yes | | First names, comma separated or a JSON list, to limit which kids are used |
+| `MCP_READ_ONLY`  | yes | `false` | `true` hides and refuses `respond_to_event` |
+| `MCP_AUTH_TOKEN` | no | | Bearer token for `/mcp` (see below) |
+| `CONFIG_TOKEN`   | no | `MCP_AUTH_TOKEN` | Bearer token for `/config` and `/healthz?check=1` |
+| `DATA_DIR`       | no | `/data` | Where saved settings are kept (`settings.json`, mode 0600) |
+| `PORT`           | no | `8080` | Server port |
+| `OTEL_*`         | no | | OpenTelemetry tracing, see [Tracing](#tracing) |
+
+The first four can be set as environment variables or on the
+[mcp-gateway](https://github.com/Olsenius/mcp-gateway) settings page. Environment
+variables always win and show as locked there. Saved settings apply at once, without
+a restart.
 
 ### Kids
 
@@ -104,6 +114,32 @@ That tool shows the full names of the participants in one event, as the Spond ap
 It fetches the event fresh each time, never caches the names, shows no contact details,
 and shows nothing when the organiser has hidden the participants. Logs hold no kid names, member IDs
 or Spond responses, and a failed login does not log Spond's login answer.
+
+## Gateway contract
+
+The server follows [mcp-gateway's upstream contract](https://github.com/Olsenius/mcp-gateway#the-upstream-contract):
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /mcp` | `MCP_AUTH_TOKEN` | Streamable HTTP MCP, stateless |
+| `GET /healthz` | none | Liveness |
+| `GET /healthz?check=1` | `CONFIG_TOKEN` | Logs in to Spond with the current settings |
+| `GET /config` | `CONFIG_TOKEN` | Settings schema and values; secrets are never returned |
+| `POST /config` | `CONFIG_TOKEN` | `{"values": {"KEY": "value"}, "clear": ["KEY"]}`; an empty secret keeps the current one |
+
+Without any token, `/config` is off (404), so nobody can change the account.
+
+## Tracing
+
+Tracing is off unless an OTLP endpoint is set, e.g.
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` (OTLP over HTTP/protobuf). The
+standard `OTEL_*` variables apply: `OTEL_SERVICE_NAME` (default `spond-mcp`),
+`OTEL_SDK_DISABLED`, `OTEL_TRACES_EXPORTER=none` and the sampler variables.
+
+The server continues the gateway's trace (`traceparent`) and makes spans for each HTTP
+request, each MCP tool and each call to the Spond API. Spans carry only the HTTP method,
+route and status, the tool name, the Spond operation (e.g. `get_events`) and the error
+type. They never carry names, IDs, arguments, answers, error messages or credentials.
 
 ## Authentication
 

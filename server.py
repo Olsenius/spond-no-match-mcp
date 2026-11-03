@@ -6,7 +6,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from opentelemetry.trace import SpanKind
 from spond.spond import Spond
+
+import telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +143,11 @@ class SpondService:
     def _set_cached(self, key: str, data: Any) -> None:
         self._cache[key] = (data, time.monotonic())
 
+    async def _call(self, operation: str, *args, **kwargs):
+        """Call the Spond library inside a client span named after the operation only."""
+        with telemetry.span(f"spond {operation}", kind=SpanKind.CLIENT, attributes={"spond.operation": operation}):
+            return await getattr(self._client, operation)(*args, **kwargs)
+
     def _forget_raw(self) -> None:
         """Drop the raw copies the Spond library keeps of its last responses."""
         for attr in RAW_CLIENT_ATTRS:
@@ -154,7 +162,7 @@ class SpondService:
     async def get_profile_id(self) -> str:
         if self._profile_id is None:
             try:
-                profile = await self._client.get_profile()
+                profile = await self._call("get_profile")
             finally:
                 self._forget_raw()
             self._profile_id = profile["id"]
@@ -166,7 +174,7 @@ class SpondService:
             return cached
         profile_id = await self.get_profile_id()
         try:
-            raw = await self._client.get_groups() or []
+            raw = await self._call("get_groups") or []
         finally:
             self._forget_raw()
         groups = [slim_group(g, profile_id, self._names) for g in raw]
@@ -215,7 +223,8 @@ class SpondService:
         now = datetime.now(UTC)
         min_start = now + timedelta(days=from_days) if from_days > 0 else now
         try:
-            raw = await self._client.get_events(
+            raw = await self._call(
+                "get_events",
                 min_start=min_start,
                 max_end=now + timedelta(days=from_days + days),
                 group_id=group_id,
@@ -231,7 +240,7 @@ class SpondService:
         # The library looks the event up in its last event list; start from a fresh one.
         self._forget_raw()
         try:
-            raw = await self._client.get_event(event_id)
+            raw = await self._call("get_event", event_id)
         finally:
             self._forget_raw()
         return slim_event(raw, family_ids)
@@ -243,7 +252,7 @@ class SpondService:
         """
         self._forget_raw()
         try:
-            raw = await self._client.get_event(event_id)
+            raw = await self._call("get_event", event_id)
         finally:
             self._forget_raw()
         if raw.get("participantsHidden"):
@@ -262,7 +271,7 @@ class SpondService:
         payload = {"accepted": "true"} if accept else {"accepted": "false"}
         if not accept and decline_message:
             payload["declineMessage"] = decline_message
-        result = await self._client.change_response(event_id, member_id, payload)
+        result = await self._call("change_response", event_id, member_id, payload)
         self.clear_cache()
         if not isinstance(result, dict):
             raise ValueError(f"Unexpected API response type: {type(result).__name__}")
@@ -281,7 +290,7 @@ class SpondService:
         if cached is not None:
             return cached
         try:
-            posts = await self._client.get_posts(group_id=group_id, max_posts=max_posts, include_comments=True)
+            posts = await self._call("get_posts", group_id=group_id, max_posts=max_posts, include_comments=True)
         finally:
             self._forget_raw()
         result = [slim_post(p) for p in posts or []]
@@ -296,7 +305,7 @@ class SpondService:
         if cached is not None:
             return cached
         try:
-            chats = await self._client.get_messages(max_chats=max_chats)
+            chats = await self._call("get_messages", max_chats=max_chats)
         finally:
             self._forget_raw()
         result = [slim_chat(c) for c in chats or []]
@@ -304,7 +313,7 @@ class SpondService:
         return result
 
     async def get_chat_messages(self, chat_id: str, limit: int = 20) -> list[dict]:
-        messages = await self._client.get_msg_history(chat_id, limit=limit)
+        messages = await self._call("get_msg_history", chat_id, limit=limit)
         return [slim_message(m) for m in messages or []]
 
 
