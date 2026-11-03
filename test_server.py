@@ -138,6 +138,10 @@ class TestFormatEventSummary:
         # UTC 12:00 → CET 13:00
         assert "13:00" in result
 
+    def test_shows_event_id(self):
+        # get_event_details and respond_to_event need it, also for answered events.
+        assert "id: EVT_TRENING_1" in format_event_summary(MOCK_EVENTS_FJORDVIK[0])
+
     def test_no_rsvp_date(self):
         result = format_event_summary(MOCK_EVENTS_FJORDVIK[0])
         assert "Svarfrist:" not in result

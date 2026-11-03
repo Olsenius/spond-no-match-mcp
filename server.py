@@ -358,6 +358,9 @@ def format_event_summary(event: dict, family_members: dict[str, str] | None = No
     if event.get("cancelled"):
         lines.append("AVLYST")
 
+    if event.get("id"):
+        lines.append(f"id: {event['id']}")
+
     return "\n".join(lines)
 
 
