@@ -7,6 +7,27 @@ import pytest
 from server import SpondService
 
 # --- Mock data: groups ---
+# Spond gives each kid a separate member ID per group, spells names differently per
+# group, and returns every member with guardians and contact details.
+
+PROFILE_ID = "PROFILE_OLA"
+PARENT = {
+    "id": "GUARDIAN_OLA",
+    "firstName": "Ola",
+    "lastName": "Nordmann",
+    "email": "ola@example.com",
+    "phoneNumber": "+4799999999",
+    "profile": {"id": PROFILE_ID},
+}
+OTHER_PARENT = {
+    "id": "GUARDIAN_KARI",
+    "firstName": "Kari",
+    "lastName": "Hansen",
+    "email": "kari.hansen@example.com",
+    "phoneNumber": "+4791111111",
+    "profile": {"id": "PROFILE_KARI"},
+}
+MOCK_PROFILE = {"id": PROFILE_ID, "firstName": "Ola", "primaryEmail": "ola@example.com"}
 
 MOCK_GROUPS = [
     {
@@ -15,9 +36,18 @@ MOCK_GROUPS = [
         "members": [
             {
                 "id": "MEMBER_OLIVER",
-                "firstName": "Oliver",
+                "firstName": "Oliver Nordmann",
                 "lastName": "Nordmann",
                 "roles": ["member"],
+                "guardians": [PARENT],
+            },
+            {
+                "id": "MEMBER_NOAH",
+                "firstName": "Noah",
+                "lastName": "Hansen",
+                "email": "noah@example.com",
+                "phoneNumber": "+4792222222",
+                "guardians": [OTHER_PARENT],
             },
             {
                 "id": "MEMBER_PARENT",
@@ -44,6 +74,7 @@ MOCK_GROUPS = [
                 "firstName": "Emma",
                 "lastName": "Nordmann",
                 "roles": ["member"],
+                "guardians": [PARENT],
             },
             {
                 "id": "MEMBER_PARENT_B",
@@ -60,15 +91,19 @@ MOCK_GROUPS = [
         "name": "Nordvik skole kull 2014",
         "members": [
             {
-                "id": "MEMBER_OLIVER",
+                "id": "MEMBER_OLIVER_SKOLE",
                 "firstName": "Oliver",
                 "lastName": "Nordmann",
                 "roles": ["member"],
+                "guardians": [PARENT],
             },
         ],
         "subGroups": [],
     },
 ]
+
+# Events carry the whole group, members included.
+RECIPIENTS_FJORDVIK = {"group": {"id": "GROUP_FJORDVIK", "members": MOCK_GROUPS[0]["members"]}}
 
 # --- Mock data: events ---
 
@@ -90,11 +125,11 @@ MOCK_EVENTS_FJORDVIK = [
         "responses": {
             "acceptedIds": ["MEMBER_OLIVER"],
             "declinedIds": [],
-            "unansweredIds": ["MEMBER_COACH"],
+            "unansweredIds": ["MEMBER_COACH", "MEMBER_NOAH"],
             "waitinglistIds": [],
             "unconfirmedIds": [],
         },
-        "recipients": {"group": {"id": "GROUP_FJORDVIK"}},
+        "recipients": RECIPIENTS_FJORDVIK,
     },
     {
         "id": "EVT_KAMP_1",
@@ -170,12 +205,28 @@ MOCK_EVENT_DETAIL = {
     "rsvpDate": "2026-02-24T12:00:00.000+00:00",
 }
 
-MOCK_ALL_EVENTS = MOCK_EVENTS_FJORDVIK + MOCK_EVENTS_SOLVIK
-
-KIDS_CONFIG = [
-    {"name": "Oliver", "groups": ["Fjordvik FK G2013", "Nordvik skole kull 2014"]},
-    {"name": "Emma", "groups": ["Solvik IL 2017"]},
+MOCK_EVENTS_NORDVIK = [
+    {
+        "id": "EVT_SKOLE_1",
+        "heading": "Foreldremøte",
+        "type": "EVENT",
+        "startTimestamp": "2026-02-27T17:00:00.000+00:00",
+        "endTimestamp": "2026-02-27T18:00:00.000+00:00",
+        "cancelled": False,
+        "description": "",
+        "location": {"feature": "Nordvik skole"},
+        "responses": {
+            "acceptedIds": [],
+            "declinedIds": [],
+            "unansweredIds": [],
+            "waitinglistIds": ["MEMBER_OLIVER_SKOLE"],
+            "unconfirmedIds": [],
+        },
+        "recipients": {"group": {"id": "GROUP_NORDVIK"}},
+    },
 ]
+
+MOCK_ALL_EVENTS = MOCK_EVENTS_FJORDVIK + MOCK_EVENTS_SOLVIK + MOCK_EVENTS_NORDVIK
 
 MOCK_POSTS = [
     {
@@ -187,6 +238,7 @@ MOCK_POSTS = [
             "id": "MEMBER_COACH",
             "firstName": "Trener",
             "lastName": "Hansen",
+            "email": "trener@example.com",
         },
         "comments": [
             {"id": "COMMENT_1", "body": "Notert!", "timestamp": "2026-02-22T11:00:00.000+00:00"},
@@ -226,6 +278,7 @@ MOCK_POSTS = [
 def mock_spond_client():
     """Mock Spond client with pre-configured responses."""
     client = AsyncMock()
+    client.get_profile = AsyncMock(return_value=MOCK_PROFILE)
     client.get_groups = AsyncMock(return_value=MOCK_GROUPS)
 
     async def mock_get_events(min_start=None, max_end=None, group_id=None, **kwargs):
@@ -234,11 +287,20 @@ def mock_spond_client():
         elif group_id == "GROUP_SOLVIK":
             return MOCK_EVENTS_SOLVIK
         elif group_id == "GROUP_NORDVIK":
-            return []
+            return MOCK_EVENTS_NORDVIK
         return MOCK_ALL_EVENTS
 
     client.get_events = AsyncMock(side_effect=mock_get_events)
-    client.get_event = AsyncMock(return_value=MOCK_EVENT_DETAIL)
+
+    async def mock_get_event(uid):
+        if uid == MOCK_EVENT_DETAIL["id"]:
+            return MOCK_EVENT_DETAIL
+        for e in MOCK_ALL_EVENTS:
+            if e["id"] == uid:
+                return e
+        raise KeyError(uid)
+
+    client.get_event = AsyncMock(side_effect=mock_get_event)
     client.change_response = AsyncMock(return_value={"acceptedIds": ["MEMBER_OLIVER"], "declinedIds": []})
 
     async def mock_get_posts(group_id=None, max_posts=20, include_comments=True):
@@ -248,6 +310,29 @@ def mock_spond_client():
         return posts[:max_posts]
 
     client.get_posts = AsyncMock(side_effect=mock_get_posts)
+    client.get_messages = AsyncMock(
+        return_value=[
+            {
+                "id": "CHAT_1",
+                "title": "Foreldre G2013",
+                "lastMessage": {
+                    "body": "Hvem kjører?",
+                    "timestamp": "2026-02-22T12:00:00.000+00:00",
+                    "sender": {"firstName": "Kari", "lastName": "Hansen", "email": "kari.hansen@example.com"},
+                },
+                "participants": [OTHER_PARENT, PARENT],
+            }
+        ]
+    )
+    client.get_msg_history = AsyncMock(
+        return_value=[
+            {
+                "body": "Jeg kan kjøre",
+                "timestamp": "2026-02-22T12:05:00.000+00:00",
+                "sender": {"firstName": "Kari", "phoneNumber": "+4791111111"},
+            }
+        ]
+    )
     client.clientsession = MagicMock()
     client.clientsession.close = AsyncMock()
     return client
@@ -255,11 +340,11 @@ def mock_spond_client():
 
 @pytest.fixture
 def service(mock_spond_client):
-    """SpondService with mock client and kids config."""
-    return SpondService(client=mock_spond_client, kids_config=KIDS_CONFIG)
+    """SpondService that finds the kids through guardian links (no KIDS_CONFIG)."""
+    return SpondService(client=mock_spond_client)
 
 
 @pytest.fixture
-def service_no_kids(mock_spond_client):
-    """SpondService with mock client but no kids config."""
-    return SpondService(client=mock_spond_client, kids_config=[])
+def service_only_emma(mock_spond_client):
+    """SpondService with KIDS_CONFIG limiting the kids to Emma."""
+    return SpondService(client=mock_spond_client, kids_config=["Emma"])

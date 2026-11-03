@@ -1,5 +1,6 @@
 """Unit tests for Spond MCP server."""
 
+import logging
 import time
 
 import pytest
@@ -164,12 +165,15 @@ class TestFormatEventDetail:
 
 class TestFormatGroupSummary:
     def test_group_with_members(self):
-        result = format_group_summary(MOCK_GROUPS[0])
-        assert "Fjordvik FK G2013" in result
-        assert "3 medlemmer" in result
+        result = format_group_summary({"name": "Fjordvik FK G2013", "member_count": 4, "kids": {}})
+        assert result == "Fjordvik FK G2013 (4 medlemmer)"
+
+    def test_group_with_kids(self):
+        group = {"name": "Fjordvik FK G2013", "member_count": 4, "kids": {"M1": "Oliver"}}
+        assert "dine barn: Oliver" in format_group_summary(group)
 
     def test_empty_group(self):
-        result = format_group_summary({"name": "Tomgruppe", "members": []})
+        result = format_group_summary({"name": "Tomgruppe", "member_count": 0, "kids": {}})
         assert "0 medlemmer" in result
 
 
@@ -234,10 +238,11 @@ class TestSpondServiceCache:
 
 class TestFamilyResolution:
     @pytest.mark.asyncio
-    async def test_resolves_oliver(self, service):
+    async def test_resolves_oliver_in_every_group(self, service):
+        # "Oliver Nordmann" in one group, "Oliver" in another, with separate member IDs.
         family = await service.resolve_family_members()
-        assert "MEMBER_OLIVER" in family
         assert family["MEMBER_OLIVER"] == "Oliver"
+        assert family["MEMBER_OLIVER_SKOLE"] == "Oliver"
 
     @pytest.mark.asyncio
     async def test_resolves_emma(self, service):
@@ -246,36 +251,44 @@ class TestFamilyResolution:
         assert family["MEMBER_EMMA"] == "Emma"
 
     @pytest.mark.asyncio
-    async def test_does_not_resolve_coaches(self, service):
+    async def test_only_own_kids(self, service):
         family = await service.resolve_family_members()
-        assert "MEMBER_COACH" not in family
+        assert set(family) == {"MEMBER_OLIVER", "MEMBER_OLIVER_SKOLE", "MEMBER_EMMA"}
 
     @pytest.mark.asyncio
-    async def test_no_kids_config_returns_empty(self, service_no_kids):
-        family = await service_no_kids.resolve_family_members()
-        assert family == {}
+    async def test_kids_config_limits_kids(self, service_only_emma):
+        family = await service_only_emma.resolve_family_members()
+        assert family == {"MEMBER_EMMA": "Emma"}
+
+    @pytest.mark.asyncio
+    async def test_old_kids_config_format(self, mock_spond_client):
+        from server import SpondService
+
+        service = SpondService(mock_spond_client, kids_config=[{"name": "Oliver Nordmann", "groups": ["x"]}])
+        assert set((await service.resolve_family_members()).values()) == {"Oliver"}
 
     @pytest.mark.asyncio
     async def test_family_cached(self, service):
         await service.resolve_family_members()
         await service.resolve_family_members()
-        # Groups only fetched once (family resolution uses groups)
         service._client.get_groups.assert_awaited_once()
+        service._client.get_profile.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_find_member_id(self, service):
-        member_id = await service.find_member_id("Oliver")
-        assert member_id == "MEMBER_OLIVER"
+    async def test_kid_member_ids(self, service):
+        assert await service.kid_member_ids("Oliver") == {"MEMBER_OLIVER", "MEMBER_OLIVER_SKOLE"}
 
     @pytest.mark.asyncio
-    async def test_find_member_id_case_insensitive(self, service):
-        member_id = await service.find_member_id("oliver")
-        assert member_id == "MEMBER_OLIVER"
+    async def test_kid_member_ids_case_and_full_name(self, service):
+        assert await service.kid_member_ids("oliver nordmann") == {"MEMBER_OLIVER", "MEMBER_OLIVER_SKOLE"}
 
     @pytest.mark.asyncio
-    async def test_find_member_id_unknown(self, service):
-        member_id = await service.find_member_id("Ukjent")
-        assert member_id is None
+    async def test_kid_member_ids_unknown(self, service):
+        assert await service.kid_member_ids("Ukjent") == set()
+
+    @pytest.mark.asyncio
+    async def test_kid_names(self, service):
+        assert await service.kid_names() == ["Emma", "Oliver"]
 
 
 # --- SpondService group matching ---
@@ -300,19 +313,6 @@ class TestGroupMatching:
         gid = service.find_group_id("Nonexistent", groups)
         assert gid is None
 
-    def test_get_kid_groups(self, service):
-        groups = service.get_kid_group_names("Oliver")
-        assert "Fjordvik FK G2013" in groups
-        assert "Nordvik skole kull 2014" in groups
-
-    def test_get_kid_groups_case_insensitive(self, service):
-        groups = service.get_kid_group_names("emma")
-        assert "Solvik IL 2017" in groups
-
-    def test_get_kid_groups_unknown(self, service):
-        groups = service.get_kid_group_names("Ukjent")
-        assert groups == []
-
 
 # --- Tool handlers via handle_tool_call ---
 
@@ -329,24 +329,39 @@ class TestListGroups:
     @pytest.mark.asyncio
     async def test_member_counts(self, service):
         result = await handle_tool_call(service, "list_groups", {})
-        assert "3 medlemmer" in result  # Fjordvik
+        assert "4 medlemmer" in result  # Fjordvik
         assert "2 medlemmer" in result  # Solvik
         assert "1 medlemmer" in result  # Nordvik
+
+    @pytest.mark.asyncio
+    async def test_shows_kids_per_group(self, service):
+        result = await handle_tool_call(service, "list_groups", {})
+        assert "Fjordvik FK G2013 (4 medlemmer) — dine barn: Oliver" in result
+        assert "Solvik IL 2017 (2 medlemmer) — dine barn: Emma" in result
 
 
 class TestGetUpcomingEvents:
     @pytest.mark.asyncio
     async def test_all_events(self, service):
         result = await handle_tool_call(service, "get_upcoming_events", {"days": 7})
-        assert "3 stk" in result
+        assert "4 stk" in result
         assert "Trening" in result
         assert "Seriekamp" in result
 
     @pytest.mark.asyncio
     async def test_filter_by_kid(self, service):
         result = await handle_tool_call(service, "get_upcoming_events", {"kid_name": "Oliver"})
-        assert "Oliver" in result
-        assert "Seriekamp" in result
+        assert "for Oliver (3 stk)" in result
+        assert "Oliver: bekreftet" in result  # Trening
+        assert "Oliver: ikke svart" in result  # Seriekamp
+        assert "Oliver: venteliste" in result  # Foreldremøte, other group and member ID
+        assert "Nordvik minibane" not in result  # Emma's event
+
+    @pytest.mark.asyncio
+    async def test_each_event_shows_which_kids(self, service):
+        result = await handle_tool_call(service, "get_upcoming_events", {})
+        assert "Svar: Emma: bekreftet" in result
+        assert "Svar: Oliver: ikke svart" in result
 
     @pytest.mark.asyncio
     async def test_filter_by_group(self, service):
@@ -356,7 +371,7 @@ class TestGetUpcomingEvents:
     @pytest.mark.asyncio
     async def test_unknown_kid(self, service):
         result = await handle_tool_call(service, "get_upcoming_events", {"kid_name": "Ukjent"})
-        assert "Ukjent barn" in result
+        assert "Ukjent barn: Ukjent (kjente barn: Emma, Oliver)" in result
 
     @pytest.mark.asyncio
     async def test_unknown_group(self, service):
@@ -423,6 +438,29 @@ class TestRespondToEvent:
         assert "akseptert" in result
         assert "Oliver" in result
         service._client.change_response.assert_awaited_once_with("EVT_KAMP_1", "MEMBER_OLIVER", {"accepted": "true"})
+
+    @pytest.mark.asyncio
+    async def test_uses_member_id_of_events_group(self, service):
+        service._client.change_response.return_value = {"acceptedIds": ["MEMBER_OLIVER_SKOLE"]}
+        result = await handle_tool_call(
+            service,
+            "respond_to_event",
+            {"event_id": "EVT_SKOLE_1", "kid_name": "Oliver", "accept": True},
+        )
+        assert "akseptert" in result
+        service._client.change_response.assert_awaited_once_with(
+            "EVT_SKOLE_1", "MEMBER_OLIVER_SKOLE", {"accepted": "true"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_kid_not_invited(self, service):
+        result = await handle_tool_call(
+            service,
+            "respond_to_event",
+            {"event_id": "EVT_KAMP_1", "kid_name": "Emma", "accept": True},
+        )
+        assert "ikke invitert" in result
+        service._client.change_response.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_decline_with_message(self, service):
@@ -587,7 +625,7 @@ class TestGetPosts:
         assert "Velkommen" not in result
 
     @pytest.mark.asyncio
-    async def test_unknown_group(self, service):
+    async def test_unknown_group_posts(self, service):
         result = await handle_tool_call(service, "get_posts", {"group_name": "Finnesikke"})
         assert "Fant ingen gruppe" in result
 
@@ -606,6 +644,72 @@ class TestGetPosts:
     async def test_posts_include_group_name(self, service):
         result = await handle_tool_call(service, "get_posts", {})
         assert "Fjordvik FK G2013" in result
+
+
+# --- Other people's data ---
+
+ALL_TOOL_CALLS = [
+    ("list_groups", {}),
+    ("get_upcoming_events", {}),
+    ("get_upcoming_events", {"kid_name": "Oliver"}),
+    ("get_upcoming_events", {"group_name": "Fjordvik"}),
+    ("get_event_details", {"event_id": "EVT_TRENING_1"}),
+    ("get_event_details", {"event_id": "EVT_KAMP_1"}),
+    ("get_attendance", {}),
+    ("search_events", {"query": "trening"}),
+    ("get_posts", {}),
+    ("get_chats", {}),
+    ("get_chat_messages", {"chat_id": "CHAT_1"}),
+    ("respond_to_event", {"event_id": "EVT_KAMP_1", "kid_name": "Oliver", "accept": True}),
+]
+CONTACT_DATA = ["@example.com", "+479", "Noah", "MEMBER_NOAH", "GUARDIAN_", "Hansen"]
+
+
+class TestOtherPeoplesData:
+    @pytest.mark.asyncio
+    async def test_no_contact_data_in_tool_answers(self, service):
+        for name, args in ALL_TOOL_CALLS:
+            result = await handle_tool_call(service, name, args)
+            for needle in CONTACT_DATA:
+                assert needle not in result, (name, needle)
+
+    @pytest.mark.asyncio
+    async def test_cache_keeps_no_other_members(self, service):
+        for name, args in ALL_TOOL_CALLS[:-1]:
+            await handle_tool_call(service, name, args)
+        cached = repr(service._cache)
+        for needle in CONTACT_DATA + ["MEMBER_COACH"]:
+            assert needle not in cached, needle
+
+    @pytest.mark.asyncio
+    async def test_counts_survive_slimming(self, service):
+        result = await handle_tool_call(service, "get_event_details", {"event_id": "EVT_TRENING_1"})
+        assert "1 ja, 0 nei, 2 ikke svart (av 3)" in result
+
+    @pytest.mark.asyncio
+    async def test_library_copies_dropped(self, service):
+        client = service._client
+        for attr in ("profile", "groups", "events", "posts", "messages"):
+            setattr(client, attr, ["raw"])
+        for name, args in ALL_TOOL_CALLS[:-1]:
+            await handle_tool_call(service, name, args)
+        for attr in ("profile", "groups", "events", "posts", "messages"):
+            assert getattr(client, attr) is None, attr
+
+    @pytest.mark.asyncio
+    async def test_logs_have_no_kid_names_or_api_answers(self, service, caplog):
+        caplog.set_level(logging.DEBUG)
+        service._client.change_response.return_value = {"acceptedIds": [], "unansweredIds": ["MEMBER_NOAH"]}
+        await handle_tool_call(
+            service, "respond_to_event", {"event_id": "EVT_KAMP_1", "kid_name": "Oliver", "accept": True}
+        )
+        service._client.change_response.side_effect = RuntimeError("boom")
+        await handle_tool_call(
+            service, "respond_to_event", {"event_id": "EVT_KAMP_1", "kid_name": "Oliver", "accept": True}
+        )
+        assert caplog.records
+        for needle in ["Oliver", "MEMBER_", "boom"]:
+            assert needle not in caplog.text, needle
 
 
 # --- Tool definitions ---

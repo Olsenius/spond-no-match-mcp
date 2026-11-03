@@ -14,17 +14,110 @@ WEEKDAYS_NO = ["mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "s
 LOCAL_TZ = ZoneInfo("Europe/Oslo")
 
 
+RESPONSE_LISTS = ("acceptedIds", "declinedIds", "unansweredIds", "waitinglistIds", "unconfirmedIds")
+EVENT_FIELDS = ("id", "heading", "startTimestamp", "endTimestamp", "rsvpDate", "cancelled", "description")
+LOCATION_FIELDS = ("feature", "address", "latitude", "longitude")
+
+# Attributes where the Spond library keeps a raw copy of the last response.
+RAW_CLIENT_ATTRS = ("profile", "groups", "events", "posts", "messages")
+
+
+def kid_display_name(member: dict) -> str:
+    """Spond stores names differently per group ("Astrid" vs "Astrid Olsen"); use the first word."""
+    first = (member.get("firstName") or "").split()
+    return first[0] if first else ""
+
+
+def kid_name_filter(kids_config: list | None) -> set[str]:
+    """KIDS_CONFIG is optional: a list of first names (or {"name": ...} objects) to limit the kids."""
+    names = set()
+    for entry in kids_config or []:
+        name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
+        if name.strip():
+            names.add(name.split()[0].lower())
+    return names
+
+
+def is_guardian(member: dict, profile_id: str) -> bool:
+    return any((g.get("profile") or {}).get("id") == profile_id for g in member.get("guardians") or [])
+
+
+def slim_group(group: dict, profile_id: str, names: set[str]) -> dict:
+    """Keep the group and the logged-in user's kids; drop everyone else's data."""
+    kids = {}
+    for m in group.get("members") or []:
+        if not is_guardian(m, profile_id):
+            continue
+        name = kid_display_name(m)
+        if name and (not names or name.lower() in names):
+            kids[m["id"]] = name
+    return {
+        "id": group["id"],
+        "name": group.get("name", ""),
+        "member_count": len(group.get("members") or []),
+        "kids": kids,
+    }
+
+
+def slim_event(event: dict, family_ids: set[str]) -> dict:
+    """Keep what the tools show. Responses keep counts and only the user's kids' IDs."""
+    slim = {k: event[k] for k in EVENT_FIELDS if k in event}
+    location = event.get("location") or {}
+    slim["location"] = {k: location[k] for k in LOCATION_FIELDS if k in location}
+    responses = event.get("responses") or {}
+    slim["responses"] = {k: [i for i in responses.get(k) or [] if i in family_ids] for k in RESPONSE_LISTS}
+    slim["responseCounts"] = {k: len(responses.get(k) or []) for k in RESPONSE_LISTS}
+    return slim
+
+
+def first_name_only(person: dict | None) -> dict:
+    return {"firstName": (person or {}).get("firstName", "")}
+
+
+def slim_post(post: dict) -> dict:
+    return {
+        "id": post.get("id", ""),
+        "body": post.get("body", ""),
+        "timestamp": post.get("timestamp", ""),
+        "groupId": post.get("groupId", ""),
+        "createdByProfile": first_name_only(post.get("createdByProfile")),
+        "commentCount": len(post.get("comments") or []),
+    }
+
+
+def slim_message(msg: dict | None) -> dict:
+    msg = msg or {}
+    return {
+        "body": msg.get("body", ""),
+        "timestamp": msg.get("timestamp", ""),
+        "sender": first_name_only(msg.get("sender")),
+    }
+
+
+def slim_chat(chat: dict) -> dict:
+    return {
+        "id": chat.get("id", ""),
+        "title": chat.get("title", ""),
+        "lastMessage": slim_message(chat.get("lastMessage")),
+    }
+
+
 class SpondService:
-    """Wraps the Spond library with TTL caching and family member resolution."""
+    """Wraps the Spond library with TTL caching and family member resolution.
+
+    Spond returns whole member lists, with other people's names and contact details,
+    in groups and events. Everything is slimmed right after fetching, so the cache
+    only holds what the tools show and the logged-in user's kids.
+    """
 
     GROUPS_TTL = 3600.0  # 1 hour
     EVENTS_TTL = 300.0  # 5 minutes
-    MEMBERS_TTL = 3600.0  # 1 hour
 
-    def __init__(self, client: Spond, kids_config: list[dict] | None = None):
+    def __init__(self, client: Spond, kids_config: list | None = None):
         self._client = client
-        self._kids = kids_config or []
+        self._names = kid_name_filter(kids_config)
         self._cache: dict[str, tuple[Any, float]] = {}
+        self._profile_id: str | None = None
         self._family_members: dict[str, str] | None = None
         self._group_map: dict[str, str] | None = None
 
@@ -38,16 +131,36 @@ class SpondService:
     def _set_cached(self, key: str, data: Any) -> None:
         self._cache[key] = (data, time.monotonic())
 
+    def _forget_raw(self) -> None:
+        """Drop the raw copies the Spond library keeps of its last responses."""
+        for attr in RAW_CLIENT_ATTRS:
+            if hasattr(self._client, attr):
+                setattr(self._client, attr, None)
+
     def clear_cache(self) -> None:
         self._cache.clear()
         self._family_members = None
         self._group_map = None
 
+    async def get_profile_id(self) -> str:
+        if self._profile_id is None:
+            try:
+                profile = await self._client.get_profile()
+            finally:
+                self._forget_raw()
+            self._profile_id = profile["id"]
+        return self._profile_id
+
     async def get_groups(self) -> list[dict]:
         cached = self._get_cached("groups", self.GROUPS_TTL)
         if cached is not None:
             return cached
-        groups = await self._client.get_groups()
+        profile_id = await self.get_profile_id()
+        try:
+            raw = await self._client.get_groups() or []
+        finally:
+            self._forget_raw()
+        groups = [slim_group(g, profile_id, self._names) for g in raw]
         self._set_cached("groups", groups)
         return groups
 
@@ -59,27 +172,22 @@ class SpondService:
         return self._group_map
 
     async def resolve_family_members(self) -> dict[str, str]:
-        """Map Spond member IDs to kid names using configured groups + first name matching."""
+        """Map Spond member IDs to kid names. A kid has one member ID per group."""
         if self._family_members is not None:
             return self._family_members
-
-        groups = await self.get_groups()
         family: dict[str, str] = {}
-
-        for kid in self._kids:
-            kid_name = kid["name"]
-            kid_groups = kid.get("groups", [])
-
-            for group in groups:
-                if not fuzzy_match_group(group["name"], kid_groups):
-                    continue
-                for member in group.get("members", []):
-                    if member.get("firstName", "").lower() == kid_name.lower():
-                        family[member["id"]] = kid_name
-                        break
-
+        for group in await self.get_groups():
+            family.update(group["kids"])
         self._family_members = family
         return family
+
+    async def kid_member_ids(self, kid_name: str) -> set[str]:
+        family = await self.resolve_family_members()
+        wanted = kid_name.split()[0].lower() if kid_name.strip() else ""
+        return {mid for mid, name in family.items() if name.lower() == wanted}
+
+    async def kid_names(self) -> list[str]:
+        return sorted(set((await self.resolve_family_members()).values()))
 
     def find_group_id(self, group_name: str, groups: list[dict]) -> str | None:
         name_lower = group_name.lower()
@@ -88,30 +196,36 @@ class SpondService:
                 return g["id"]
         return None
 
-    def get_kid_group_names(self, kid_name: str) -> list[str]:
-        for kid in self._kids:
-            if kid["name"].lower() == kid_name.lower():
-                return kid.get("groups", [])
-        return []
-
     async def get_events(self, days: int = 7, group_id: str | None = None, from_days: int = 0) -> list[dict]:
         cache_key = f"events:{days}:{from_days}:{group_id or 'all'}"
         cached = self._get_cached(cache_key, self.EVENTS_TTL)
         if cached is not None:
             return cached
 
+        family_ids = set(await self.resolve_family_members())
         now = datetime.now(UTC)
         min_start = now + timedelta(days=from_days) if from_days > 0 else now
-        events = await self._client.get_events(
-            min_start=min_start,
-            max_end=now + timedelta(days=from_days + days),
-            group_id=group_id,
-        )
+        try:
+            raw = await self._client.get_events(
+                min_start=min_start,
+                max_end=now + timedelta(days=from_days + days),
+                group_id=group_id,
+            )
+        finally:
+            self._forget_raw()
+        events = [slim_event(e, family_ids) for e in raw or []]
         self._set_cached(cache_key, events)
         return events
 
     async def get_event(self, event_id: str) -> dict:
-        return await self._client.get_event(event_id)
+        family_ids = set(await self.resolve_family_members())
+        # The library looks the event up in its last event list; start from a fresh one.
+        self._forget_raw()
+        try:
+            raw = await self._client.get_event(event_id)
+        finally:
+            self._forget_raw()
+        return slim_event(raw, family_ids)
 
     async def change_response(self, event_id: str, member_id: str, accept: bool, decline_message: str = "") -> dict:
         payload = {"accepted": "true"} if accept else {"accepted": "false"}
@@ -121,21 +235,8 @@ class SpondService:
         self.clear_cache()
         if not isinstance(result, dict):
             raise ValueError(f"Unexpected API response type: {type(result).__name__}")
-        logger.info(
-            "change_response for member %s on event %s: accept=%s result_keys=%s",
-            member_id,
-            event_id,
-            accept,
-            list(result.keys()),
-        )
+        logger.info("change_response on event %s: accept=%s result_keys=%s", event_id, accept, list(result.keys()))
         return result
-
-    async def find_member_id(self, kid_name: str) -> str | None:
-        family = await self.resolve_family_members()
-        for member_id, name in family.items():
-            if name.lower() == kid_name.lower():
-                return member_id
-        return None
 
     async def close(self) -> None:
         if hasattr(self._client, "clientsession") and self._client.clientsession:
@@ -148,8 +249,11 @@ class SpondService:
         cached = self._get_cached(cache_key, self.POSTS_TTL)
         if cached is not None:
             return cached
-        posts = await self._client.get_posts(group_id=group_id, max_posts=max_posts, include_comments=True)
-        result = posts or []
+        try:
+            posts = await self._client.get_posts(group_id=group_id, max_posts=max_posts, include_comments=True)
+        finally:
+            self._forget_raw()
+        result = [slim_post(p) for p in posts or []]
         self._set_cached(cache_key, result)
         return result
 
@@ -160,14 +264,17 @@ class SpondService:
         cached = self._get_cached(cache_key, self.CHATS_TTL)
         if cached is not None:
             return cached
-        chats = await self._client.get_messages(max_chats=max_chats)
-        result = chats or []
+        try:
+            chats = await self._client.get_messages(max_chats=max_chats)
+        finally:
+            self._forget_raw()
+        result = [slim_chat(c) for c in chats or []]
         self._set_cached(cache_key, result)
         return result
 
     async def get_chat_messages(self, chat_id: str, limit: int = 20) -> list[dict]:
         messages = await self._client.get_msg_history(chat_id, limit=limit)
-        return messages or []
+        return [slim_message(m) for m in messages or []]
 
 
 def fuzzy_match_group(group_name: str, configured_names: list[str]) -> bool:
@@ -232,6 +339,7 @@ def format_event_summary(event: dict, family_members: dict[str, str] | None = No
         accepted = set(responses.get("acceptedIds", []))
         declined = set(responses.get("declinedIds", []))
         unanswered = set(responses.get("unansweredIds", []))
+        waiting = set(responses.get("waitinglistIds", []))
 
         rsvp_parts = []
         for member_id, name in sorted(family_members.items(), key=lambda x: x[1]):
@@ -241,6 +349,8 @@ def format_event_summary(event: dict, family_members: dict[str, str] | None = No
                 rsvp_parts.append(f"{name}: avslått")
             elif member_id in unanswered:
                 rsvp_parts.append(f"{name}: ikke svart")
+            elif member_id in waiting:
+                rsvp_parts.append(f"{name}: venteliste")
 
         if rsvp_parts:
             lines.append("Svar: " + ", ".join(rsvp_parts))
@@ -266,9 +376,10 @@ def format_event_detail(event: dict, family_members: dict[str, str] | None = Non
             lines.append(f"\n{desc}")
 
     responses = event.get("responses", {})
-    n_accepted = len(responses.get("acceptedIds", []))
-    n_declined = len(responses.get("declinedIds", []))
-    n_unanswered = len(responses.get("unansweredIds", []))
+    counts = event.get("responseCounts") or {k: len(responses.get(k, [])) for k in RESPONSE_LISTS}
+    n_accepted = counts.get("acceptedIds", 0)
+    n_declined = counts.get("declinedIds", 0)
+    n_unanswered = counts.get("unansweredIds", 0)
     total = n_accepted + n_declined + n_unanswered
     if total > 0:
         lines.append(f"\nPåmelding: {n_accepted} ja, {n_declined} nei, {n_unanswered} ikke svart (av {total})")
@@ -278,8 +389,11 @@ def format_event_detail(event: dict, family_members: dict[str, str] | None = Non
 
 def format_group_summary(group: dict) -> str:
     name = group.get("name", "Ukjent")
-    members = group.get("members", [])
-    return f"{name} ({len(members)} medlemmer)"
+    line = f"{name} ({group.get('member_count', 0)} medlemmer)"
+    kids = sorted(set(group.get("kids", {}).values()))
+    if kids:
+        line += f" — dine barn: {', '.join(kids)}"
+    return line
 
 
 def format_chat_summary(chat: dict) -> str:
@@ -335,9 +449,9 @@ def format_post_summary(post: dict, group_map: dict[str, str] | None = None) -> 
     if body:
         lines.append(body)
 
-    comments = post.get("comments", [])
-    if comments:
-        lines.append(f"({len(comments)} kommentar{'er' if len(comments) != 1 else ''})")
+    n_comments = post.get("commentCount", len(post.get("comments") or []))
+    if n_comments:
+        lines.append(f"({n_comments} kommentar{'er' if n_comments != 1 else ''})")
 
     return "\n".join(lines)
 
@@ -379,7 +493,7 @@ TOOLS = [
                 },
                 "kid_name": {
                     "type": "string",
-                    "description": "Filtrér på barnets navn (viser kun aktiviteter i barnets grupper)",
+                    "description": "Filtrér på barnets fornavn (viser kun aktiviteter barnet er invitert til)",
                 },
             },
         },
@@ -536,6 +650,21 @@ TOOLS = [
 ]
 
 
+def event_member_ids(event: dict) -> set[str]:
+    responses = event.get("responses") or {}
+    return {i for k in RESPONSE_LISTS for i in responses.get(k) or []}
+
+
+async def unknown_kid(service: SpondService, kid_name: str) -> str:
+    names = await service.kid_names()
+    return f"Ukjent barn: {kid_name} (kjente barn: {', '.join(names) or 'ingen'})"
+
+
+async def kid_events(service: SpondService, kid_ids: set[str], days: int, from_days: int) -> list[dict]:
+    """Events the kid is invited to, in any group."""
+    return [e for e in await service.get_events(days=days, from_days=from_days) if kid_ids & event_member_ids(e)]
+
+
 async def handle_list_groups(service: SpondService) -> str:
     groups = await service.get_groups()
     if not groups:
@@ -552,22 +681,10 @@ async def handle_get_upcoming_events(
     group_id = None
 
     if kid_name:
-        kid_group_names = service.get_kid_group_names(kid_name)
-        if not kid_group_names:
-            return f"Ukjent barn: {kid_name}"
-        groups = await service.get_groups()
-        all_events: list[dict] = []
-        seen_ids: set[str] = set()
-        for gname in kid_group_names:
-            gid = service.find_group_id(gname, groups)
-            if gid:
-                events = await service.get_events(days=days, group_id=gid, from_days=from_days)
-                for e in events:
-                    eid = e.get("id", "")
-                    if eid not in seen_ids:
-                        seen_ids.add(eid)
-                        all_events.append(e)
-        events = sorted(all_events, key=lambda e: e.get("startTimestamp", ""))
+        kid_ids = await service.kid_member_ids(kid_name)
+        if not kid_ids:
+            return await unknown_kid(service, kid_name)
+        events = await kid_events(service, kid_ids, days, from_days)
     elif group_name:
         groups = await service.get_groups()
         group_id = service.find_group_id(group_name, groups)
@@ -605,20 +722,10 @@ async def handle_get_event_details(service: SpondService, event_id: str) -> str:
 
 async def handle_get_attendance(service: SpondService, kid_name: str = "", days: int = 14, from_days: int = 0) -> str:
     if kid_name:
-        kid_group_names = service.get_kid_group_names(kid_name)
-        if not kid_group_names:
-            return f"Ukjent barn: {kid_name}"
-        groups = await service.get_groups()
-        all_events: list[dict] = []
-        seen_ids: set[str] = set()
-        for gname in kid_group_names:
-            gid = service.find_group_id(gname, groups)
-            if gid:
-                for e in await service.get_events(days=days, group_id=gid, from_days=from_days):
-                    if e.get("id", "") not in seen_ids:
-                        seen_ids.add(e["id"])
-                        all_events.append(e)
-        events = all_events
+        kid_ids = await service.kid_member_ids(kid_name)
+        if not kid_ids:
+            return await unknown_kid(service, kid_name)
+        events = await kid_events(service, kid_ids, days, from_days)
     else:
         events = await service.get_events(days=days, from_days=from_days)
 
@@ -627,7 +734,7 @@ async def handle_get_attendance(service: SpondService, kid_name: str = "", days:
 
     family = await service.resolve_family_members()
     if not family:
-        return "Ingen familiemedlemmer funnet i Spond-grupper."
+        return "Fant ingen barn der du er foresatt i Spond-gruppene."
 
     unanswered_events = []
     for event in sorted(events, key=lambda e: e.get("startTimestamp", "")):
@@ -665,18 +772,25 @@ async def handle_respond_to_event(
     accept: bool,
     decline_message: str = "",
 ) -> str:
-    member_id = await service.find_member_id(kid_name)
-    if not member_id:
-        return f"Fant ikke {kid_name} i noen Spond-gruppe."
+    kid_ids = await service.kid_member_ids(kid_name)
+    if not kid_ids:
+        return f"Fant ikke {kid_name} blant barna dine i Spond."
+
+    # A kid has a separate member ID in each group; answer with the one invited to this event.
+    event = await service.get_event(event_id)
+    invited = sorted(kid_ids & event_member_ids(event))
+    if not invited:
+        return f"{kid_name} er ikke invitert til denne aktiviteten."
+    member_id = invited[0]
 
     try:
         result = await service.change_response(event_id, member_id, accept, decline_message)
     except Exception as e:
-        logger.error("change_response failed for %s event %s: %s", kid_name, event_id, e)
+        logger.error("change_response failed for event %s: %s", event_id, type(e).__name__)
         return f"Feil ved svar for {kid_name}: {e}"
 
     if isinstance(result, dict) and "error" in result:
-        logger.error("Spond API error for %s event %s: %s", kid_name, event_id, result)
+        logger.error("Spond API error for event %s", event_id)
         return f"Spond returnerte feil for {kid_name}: {result.get('error', result)}"
 
     accepted_ids = set()
@@ -692,11 +806,9 @@ async def handle_respond_to_event(
     else:
         action = "akseptert" if accept else "avslått"
         logger.warning(
-            "Response may not have been saved for %s (member %s) on event %s. API returned: %s",
-            kid_name,
-            member_id,
+            "Response may not have been saved on event %s. API returned keys: %s",
             event_id,
-            result,
+            list(result.keys()) if isinstance(result, dict) else type(result).__name__,
         )
         return f"Svar sendt for {kid_name}, men kunne ikke bekrefte at det ble {action}. Sjekk Spond-appen."
 

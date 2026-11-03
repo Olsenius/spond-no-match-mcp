@@ -11,6 +11,7 @@ import uvicorn
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import TextContent, Tool
+from spond import AuthenticationError
 from spond.spond import Spond
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -88,6 +89,10 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     try:
         result = await handle_tool_call(get_service(), name, arguments)
+    except AuthenticationError:
+        # The error message holds Spond's raw login response; keep it out of logs and answers.
+        logger.error("Tool %s failed: Spond login failed", name)
+        result = "Feil: innlogging til Spond feilet. Sjekk SPOND_USERNAME og SPOND_PASSWORD."
     except Exception as e:
         logger.exception("Tool %s failed", name)
         result = f"Feil: {e}"
@@ -118,9 +123,9 @@ async def healthz(request: Request):
         try:
             groups = await get_service().get_groups()
             checks.append({"name": "Login", "ok": True, "detail": f"logged in, {len(groups or [])} groups"})
-        except Exception:
-            # The Spond library puts the raw login response in its errors; keep it out of the answer.
-            logger.exception("Health check failed")
+        except Exception as e:
+            # The Spond library puts the raw login response in its errors; keep it out of logs and answers.
+            logger.error("Health check failed: %s", type(e).__name__)
             checks.append({"name": "Login", "ok": False, "detail": "could not log in to Spond"})
     ok = all(c["ok"] for c in checks)
     body = {"ok": ok, "status": "ok" if ok else "error", "checks": checks}

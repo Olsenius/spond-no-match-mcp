@@ -5,9 +5,10 @@ An [MCP](https://modelcontextprotocol.io/) server for managing kids' sports acti
 ## Features
 
 - **Six tools** — list groups, upcoming events, event details, attendance status, RSVP, and search
-- **Family member mapping** — configure which kids belong to which groups
+- **Finds your kids** — kids where you are a guardian in Spond, with their status on every event
 - **Norwegian output** — responses formatted in Norwegian (dates, weekdays, status labels)
 - **TTL caching** — groups cached 1h, events 5min to minimize API calls
+- **Keeps other families' data out** — see [Privacy](#privacy)
 - **Bearer token auth** — optional authentication for protecting sensitive family data
 - **Scale-to-zero ready** — lightweight Python server, works great on Knative
 
@@ -15,8 +16,8 @@ An [MCP](https://modelcontextprotocol.io/) server for managing kids' sports acti
 
 | Tool                  | Description                                                     |
 | --------------------- | --------------------------------------------------------------- |
-| `list_groups`         | List all Spond groups with member counts                        |
-| `get_upcoming_events` | Get upcoming events, filterable by kid or group                 |
+| `list_groups`         | List all Spond groups with member counts and which kids are in them |
+| `get_upcoming_events` | Get upcoming events with each kid's response, filterable by kid or group |
 | `get_event_details`   | Full details for a specific event (location, description, RSVP) |
 | `get_attendance`      | Show which events are missing responses for your kids           |
 | `respond_to_event`    | Accept or decline an event for a family member                  |
@@ -38,7 +39,6 @@ pip install -r requirements.txt
 # Start the server
 SPOND_USERNAME=you@example.com \
 SPOND_PASSWORD=your-password \
-KIDS_CONFIG='[{"name":"Oliver","groups":["Team 2013"]},{"name":"Emma","groups":["Team 2017"]}]' \
 python main.py
 ```
 
@@ -55,7 +55,6 @@ docker build -t spond-mcp .
 docker run -p 8080:8080 \
   -e SPOND_USERNAME=you@example.com \
   -e SPOND_PASSWORD=your-password \
-  -e 'KIDS_CONFIG=[{"name":"Oliver","groups":["Team 2013"]}]' \
   spond-mcp
 ```
 
@@ -65,22 +64,41 @@ docker run -p 8080:8080 \
 | ---------------- | -------- | ----------------------- | ------------------------------------------------- |
 | `SPOND_USERNAME` | Yes      |                         | Spond account email                               |
 | `SPOND_PASSWORD` | Yes      |                         | Spond account password                            |
-| `KIDS_CONFIG`    | No       | `[]`                    | JSON array mapping kid names to Spond group names |
+| `KIDS_CONFIG`    | No       | `[]`                    | JSON array of first names, to limit which kids are used |
 | `MCP_AUTH_TOKEN` | No       |                         | Bearer token for authentication (see below)       |
 | `PORT`           | No       | `8080`                  | Server port                                       |
 
-### `KIDS_CONFIG` Format
+### Kids
 
-Maps your children's first names to their Spond group names. Group matching is fuzzy — partial matches work (e.g. `"Team 2013"` matches `"Fjordvik Team 2013"`).
+The server finds your kids by itself: every group member where the Spond account is a
+guardian. A kid has a separate member ID in each group and may be spelled differently
+("Oliver" in one group, "Oliver Nordmann" in another); the first word of the first name
+ties them together. Each event shows the response of every kid invited to it, and
+`respond_to_event` answers with the kid's member ID in that event's group.
+
+`KIDS_CONFIG` is optional. Set it to limit the kids, e.g. when the account is also a
+guardian for someone else's child:
 
 ```json
-[
-  {"name": "Oliver", "groups": ["Team 2013", "School 2014"]},
-  {"name": "Emma", "groups": ["Team 2017"]}
-]
+["Oliver", "Emma"]
 ```
 
-Without `KIDS_CONFIG`, the server still works but can't filter by kid or show per-kid attendance.
+The older format, `[{"name": "Oliver", "groups": ["Team 2013"]}]`, still works; `groups` is ignored.
+
+## Privacy
+
+Spond returns every member of a group, with guardians, e-mail addresses and phone
+numbers, both in groups and in each event. The server cannot ask for less, so it
+slims everything right after fetching:
+
+- Groups keep their name, member count and your kids' member IDs.
+- Events keep what the tools show; responses keep the counts and only your kids' IDs.
+- Posts and chats keep the text, time and the sender's first name.
+- The raw copies the Spond library keeps of its last responses are dropped.
+
+Tool answers and the cache therefore hold no other members' names or contact details,
+apart from what people write in posts and messages. Logs hold no kid names, member IDs
+or Spond responses, and a failed login does not log Spond's login answer.
 
 ## Authentication
 
