@@ -917,6 +917,48 @@ class TestBearerAuthDisabled:
         assert resp.status_code == 200
 
 
+class TestReadOnly:
+    @pytest.fixture
+    def client(self, make_client, monkeypatch):
+        monkeypatch.setattr("main.READ_ONLY", True)
+        with make_client("") as c:
+            yield c
+
+    def _call(self, client, body):
+        return client.post("/mcp", json=body, headers=MCP_HEADERS).json()["result"]
+
+    def test_write_tools_hidden(self, client):
+        tools = self._call(client, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["tools"]
+        names = {t["name"] for t in tools}
+        assert "respond_to_event" not in names
+        assert "get_upcoming_events" in names
+
+    def test_write_tools_refused(self, client, monkeypatch):
+        called = []
+        monkeypatch.setattr("main.handle_tool_call", lambda *a: called.append(a))
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "respond_to_event", "arguments": {"event_id": "E", "kid_name": "K", "accept": True}},
+        }
+        result = self._call(client, body)
+        assert "MCP_READ_ONLY" in result["content"][0]["text"]
+        assert called == []
+
+    @pytest.mark.parametrize("value,expected", [("", False), ("false", False), ("true", True), ("1", True)])
+    def test_parse_bool(self, value, expected):
+        from main import parse_bool
+
+        assert parse_bool("X", value) is expected
+
+    def test_parse_bool_rejects_garbage(self):
+        from main import parse_bool
+
+        with pytest.raises(ValueError, match="must be a boolean"):
+            parse_bool("MCP_READ_ONLY", "kanskje")
+
+
 class TestHealthCheck:
     @pytest.fixture
     def client(self, make_client):

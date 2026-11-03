@@ -492,6 +492,9 @@ def format_post_summary(post: dict, group_map: dict[str, str] | None = None) -> 
 
 # --- Tool definitions ---
 
+# Tools that change data in Spond; hidden and refused when MCP_READ_ONLY is set.
+WRITE_TOOLS = {"respond_to_event"}
+
 TOOLS = [
     {
         "name": "list_groups",

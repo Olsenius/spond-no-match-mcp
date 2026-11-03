@@ -21,12 +21,25 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from server import TOOLS, SpondService, handle_tool_call
+from server import TOOLS, WRITE_TOOLS, SpondService, handle_tool_call
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("spond-mcp")
 
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+
+
+def parse_bool(name: str, value: str) -> bool:
+    v = value.strip().lower()
+    if v in ("", "0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{name} must be a boolean")
+
+
+# Read-only hides and refuses the tools that change data in Spond.
+READ_ONLY = parse_bool("MCP_READ_ONLY", os.environ.get("MCP_READ_ONLY", ""))
 
 service: SpondService | None = None
 session_manager: StreamableHTTPSessionManager | None = None
@@ -82,11 +95,13 @@ mcp_server = Server("spond")
 
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [Tool(**t) for t in TOOLS]
+    return [Tool(**t) for t in TOOLS if not (READ_ONLY and t["name"] in WRITE_TOOLS)]
 
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
+    if READ_ONLY and name in WRITE_TOOLS:
+        return [TextContent(type="text", text=f"{name} er slått av (MCP_READ_ONLY).")]
     try:
         result = await handle_tool_call(get_service(), name, arguments)
     except AuthenticationError:
@@ -160,7 +175,7 @@ app = Starlette(
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     if AUTH_TOKEN:
-        logger.info("spond MCP server starting on :%d (auth enabled)", port)
+        logger.info("spond MCP server starting on :%d (auth enabled, read-only=%s)", port, READ_ONLY)
     else:
         logger.warning("spond MCP server starting on :%d (NO AUTH — set MCP_AUTH_TOKEN)", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", http="h11")

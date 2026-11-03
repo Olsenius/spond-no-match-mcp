@@ -67,6 +67,7 @@ docker run -p 8080:8080 \
 | `SPOND_PASSWORD` | Yes      |                         | Spond account password                            |
 | `KIDS_CONFIG`    | No       | `[]`                    | JSON array of first names, to limit which kids are used |
 | `MCP_AUTH_TOKEN` | No       |                         | Bearer token for authentication (see below)       |
+| `MCP_READ_ONLY`  | No       | `false`                 | `true` hides and refuses `respond_to_event`       |
 | `PORT`           | No       | `8080`                  | Server port                                       |
 
 ### Kids
@@ -194,7 +195,7 @@ spond-mcp (:8080)
 
 ```bash
 # Install dev dependencies
-pip install -r requirements.txt -r requirements-dev.txt
+pip install -e ".[dev]"
 
 # Run tests (87 tests, including auth middleware tests)
 pytest -v
