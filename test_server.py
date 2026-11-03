@@ -716,6 +716,58 @@ class TestOtherPeoplesData:
             assert needle not in caplog.text, needle
 
 
+# --- Participants ---
+
+
+class TestEventParticipants:
+    @pytest.mark.asyncio
+    async def test_full_names_per_response(self, service):
+        result = await handle_tool_call(service, "get_event_participants", {"event_id": "EVT_TRENING_1"})
+        assert result.startswith("Trening — mandag 23.02")
+        assert "Kommer (1):\n  Oliver Nordmann" in result
+        assert "Kommer ikke (0):" in result
+        assert "Ikke svart (2):\n  Noah Hansen\n  Trener Hansen" in result
+
+    @pytest.mark.asyncio
+    async def test_no_contact_data(self, service):
+        result = await handle_tool_call(service, "get_event_participants", {"event_id": "EVT_TRENING_1"})
+        for needle in ["@example.com", "+479", "Kari", "GUARDIAN_", "MEMBER_"]:
+            assert needle not in result, needle
+
+    @pytest.mark.asyncio
+    async def test_names_not_cached(self, service):
+        await handle_tool_call(service, "get_event_participants", {"event_id": "EVT_TRENING_1"})
+        cached = repr(service._cache)
+        assert "Noah" not in cached and "Hansen" not in cached
+        assert service._client.events is None
+
+    @pytest.mark.asyncio
+    async def test_hidden_participants(self, service):
+        hidden = {**MOCK_EVENTS_FJORDVIK[0], "participantsHidden": True}
+        service._client.get_event.side_effect = None
+        service._client.get_event.return_value = hidden
+        result = await handle_tool_call(service, "get_event_participants", {"event_id": "EVT_TRENING_1"})
+        assert "skjult" in result
+        assert "Oliver" not in result
+
+    @pytest.mark.asyncio
+    async def test_unknown_member_id(self, service):
+        # Members missing from the event's group (e.g. recipients without members) still count.
+        result = await handle_tool_call(service, "get_event_participants", {"event_id": "EVT_SKOLE_1"})
+        assert "Venteliste (1):\n  (ukjent)" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_event_id(self, service):
+        assert "påkrevd" in await handle_tool_call(service, "get_event_participants", {})
+
+    def test_full_name_not_doubled(self):
+        from server import full_name
+
+        assert full_name({"firstName": "Astrid Olsen", "lastName": "Olsen"}) == "Astrid Olsen"
+        assert full_name({"firstName": "Arvid", "lastName": "Olsen"}) == "Arvid Olsen"
+        assert full_name({"firstName": "Arvid"}) == "Arvid"
+
+
 # --- Tool definitions ---
 
 
@@ -745,7 +797,7 @@ class TestToolDefinitions:
         assert "accept" in respond["inputSchema"]["required"]
 
     def test_expected_tool_count(self):
-        assert len(TOOLS) == 9
+        assert len(TOOLS) == 10
 
     def test_tool_names(self):
         names = {t["name"] for t in TOOLS}
@@ -753,6 +805,7 @@ class TestToolDefinitions:
             "list_groups",
             "get_upcoming_events",
             "get_event_details",
+            "get_event_participants",
             "get_attendance",
             "respond_to_event",
             "search_events",

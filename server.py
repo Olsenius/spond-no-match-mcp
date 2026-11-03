@@ -28,6 +28,15 @@ def kid_display_name(member: dict) -> str:
     return first[0] if first else ""
 
 
+def full_name(member: dict) -> str:
+    """Some groups store the full name in firstName ("Astrid Olsen", lastName "Olsen")."""
+    first = (member.get("firstName") or "").strip()
+    last = (member.get("lastName") or "").strip()
+    if not last or first.endswith(last):
+        return first
+    return f"{first} {last}".strip()
+
+
 def kid_name_filter(kids_config: list | None) -> set[str]:
     """KIDS_CONFIG is optional: a list of first names (or {"name": ...} objects) to limit the kids."""
     names = set()
@@ -226,6 +235,28 @@ class SpondService:
         finally:
             self._forget_raw()
         return slim_event(raw, family_ids)
+
+    async def get_event_participants(self, event_id: str) -> dict | None:
+        """Names per response for one event, fetched fresh and never cached.
+
+        Returns None when the organiser has hidden the participants.
+        """
+        self._forget_raw()
+        try:
+            raw = await self._client.get_event(event_id)
+        finally:
+            self._forget_raw()
+        if raw.get("participantsHidden"):
+            return None
+        members = {m["id"]: m for m in ((raw.get("recipients") or {}).get("group") or {}).get("members") or []}
+        responses = raw.get("responses") or {}
+        return {
+            "event": slim_event(raw, set(await self.resolve_family_members())),
+            "names": {
+                k: sorted(full_name(members[i]) if i in members else "(ukjent)" for i in responses.get(k) or [])
+                for k in RESPONSE_LISTS
+            },
+        }
 
     async def change_response(self, event_id: str, member_id: str, accept: bool, decline_message: str = "") -> dict:
         payload = {"accepted": "true"} if accept else {"accepted": "false"}
@@ -516,6 +547,23 @@ TOOLS = [
         },
     },
     {
+        "name": "get_event_participants",
+        "description": (
+            "Vis fullt navn på deltakerne i en aktivitet, gruppert etter svar (kommer, kommer ikke, ikke svart). "
+            "Respekterer at arrangøren kan ha skjult deltakerlisten."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_id": {
+                    "type": "string",
+                    "description": "Aktivitetens ID (fra get_upcoming_events)",
+                },
+            },
+            "required": ["event_id"],
+        },
+    },
+    {
         "name": "get_attendance",
         "description": ("Vis påmeldingsstatus for kommende aktiviteter. Viser hvilke aktiviteter som mangler svar."),
         "inputSchema": {
@@ -717,6 +765,28 @@ async def handle_get_upcoming_events(
     return header + "\n\n" + "\n".join(lines).strip()
 
 
+PARTICIPANT_LABELS = {
+    "acceptedIds": "Kommer",
+    "waitinglistIds": "Venteliste",
+    "unconfirmedIds": "Ikke bekreftet",
+    "declinedIds": "Kommer ikke",
+    "unansweredIds": "Ikke svart",
+}
+
+
+async def handle_get_event_participants(service: SpondService, event_id: str) -> str:
+    result = await service.get_event_participants(event_id)
+    if result is None:
+        return "Arrangøren har skjult deltakerlisten for denne aktiviteten."
+    lines = [format_event_summary(result["event"]).split("\n")[0], ""]
+    for key, label in PARTICIPANT_LABELS.items():
+        names = result["names"][key]
+        if names or key in ("acceptedIds", "declinedIds", "unansweredIds"):
+            lines.append(f"{label} ({len(names)}):")
+            lines.extend(f"  {n}" for n in names)
+    return "\n".join(lines)
+
+
 async def handle_get_event_details(service: SpondService, event_id: str) -> str:
     event = await service.get_event(event_id)
     family = await service.resolve_family_members()
@@ -904,6 +974,11 @@ async def handle_tool_call(service: SpondService, name: str, arguments: dict | N
         if not event_id:
             return "event_id er påkrevd."
         return await handle_get_event_details(service, event_id)
+    elif name == "get_event_participants":
+        event_id = args.get("event_id", "")
+        if not event_id:
+            return "event_id er påkrevd."
+        return await handle_get_event_participants(service, event_id)
     elif name == "get_attendance":
         return await handle_get_attendance(
             service,

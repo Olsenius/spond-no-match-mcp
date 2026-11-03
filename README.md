@@ -19,6 +19,7 @@ An [MCP](https://modelcontextprotocol.io/) server for managing kids' sports acti
 | `list_groups`         | List all Spond groups with member counts and which kids are in them |
 | `get_upcoming_events` | Get upcoming events with each kid's response, filterable by kid or group |
 | `get_event_details`   | Full details for a specific event (location, description, RSVP) |
+| `get_event_participants` | Full names of the participants in an event, per response    |
 | `get_attendance`      | Show which events are missing responses for your kids           |
 | `respond_to_event`    | Accept or decline an event for a family member                  |
 | `search_events`       | Search upcoming events by text in title or description          |
@@ -97,7 +98,10 @@ slims everything right after fetching:
 - The raw copies the Spond library keeps of its last responses are dropped.
 
 Tool answers and the cache therefore hold no other members' names or contact details,
-apart from what people write in posts and messages. Logs hold no kid names, member IDs
+apart from what people write in posts and messages, and `get_event_participants`.
+That tool shows the full names of the participants in one event, as the Spond app does.
+It fetches the event fresh each time, never caches the names, shows no contact details,
+and shows nothing when the organiser has hidden the participants. Logs hold no kid names, member IDs
 or Spond responses, and a failed login does not log Spond's login answer.
 
 ## Authentication
