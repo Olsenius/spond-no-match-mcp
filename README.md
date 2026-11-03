@@ -44,8 +44,9 @@ python main.py
 
 The server starts on port 8080:
 
-- Health check: `http://localhost:8080/health`
-- MCP SSE endpoint: `http://localhost:8080/sse`
+- Health check: `http://localhost:8080/healthz` (`/health` also works)
+- Health check with a Spond login: `http://localhost:8080/healthz?check=1` (needs the bearer token)
+- MCP endpoint (Streamable HTTP): `http://localhost:8080/mcp`
 
 ### Docker
 
@@ -67,7 +68,6 @@ docker run -p 8080:8080 \
 | `KIDS_CONFIG`    | No       | `[]`                    | JSON array mapping kid names to Spond group names |
 | `MCP_AUTH_TOKEN` | No       |                         | Bearer token for authentication (see below)       |
 | `PORT`           | No       | `8080`                  | Server port                                       |
-| `BASE_URL`       | No       | `http://localhost:8080` | Public URL for SSE endpoint construction          |
 
 ### `KIDS_CONFIG` Format
 
@@ -84,9 +84,9 @@ Without `KIDS_CONFIG`, the server still works but can't filter by kid or show pe
 
 ## Authentication
 
-This server handles sensitive family data and supports optional bearer token authentication. When `MCP_AUTH_TOKEN` is set, all requests (except `/health`) must include an `Authorization: Bearer <token>` header.
+This server handles sensitive family data and supports optional bearer token authentication. When `MCP_AUTH_TOKEN` is set, all requests (except `/health` and `/healthz`) must include an `Authorization: Bearer <token>` header.
 
-- `/health` is always exempt (required for Knative/K8s health probes)
+- `/health` and `/healthz` are always exempt (required for health probes); `/healthz?check=1` is not
 - When `MCP_AUTH_TOKEN` is empty or unset, auth is disabled (backward compatible)
 - Uses constant-time comparison (`hmac.compare_digest`) to prevent timing attacks
 
@@ -98,7 +98,11 @@ SPOND_PASSWORD=your-password \
 python main.py
 
 # Test with auth
-curl -H "Authorization: Bearer my-secret-token" http://localhost:8080/sse
+curl -X POST http://localhost:8080/mcp \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
 For Kubernetes deployments, store the token as a Secret and reference it in your service manifest:
@@ -139,8 +143,7 @@ For authenticated servers, configure mcporter with the Authorization header in `
 {
   "mcpServers": {
     "spond": {
-      "url": "https://your-spond-mcp.example.com/sse",
-      "transport": "sse",
+      "url": "https://your-spond-mcp.example.com/mcp",
       "headers": {
         "Authorization": "Bearer your-token-here"
       }
@@ -153,15 +156,15 @@ For authenticated servers, configure mcporter with the Authorization header in `
 
 ```text
 MCP Client (mcporter, Claude, etc.)
-    │ HTTP/SSE (JSON-RPC)
+    │ Streamable HTTP (JSON-RPC)
     ▼
 spond-mcp (:8080)
     │
     └── api.spond.com (Spond API)
 ```
 
-- Implements the [Model Context Protocol](https://modelcontextprotocol.io/) over HTTP+SSE
-- Uses [mcp](https://pypi.org/project/mcp/) SDK with Starlette SSE transport
+- Implements the [Model Context Protocol](https://modelcontextprotocol.io/) over Streamable HTTP
+- Uses [mcp](https://pypi.org/project/mcp/) SDK in stateless mode: each request stands alone, with no server-side session
 - Uses [spond](https://github.com/Olen/Spond) library for API access
 - Stateless — all caching is in-memory with configurable TTLs
 

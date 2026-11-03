@@ -664,70 +664,124 @@ class TestServiceLifecycle:
         service._client.clientsession.close.assert_awaited_once()
 
 
-# --- Bearer auth middleware ---
+# --- HTTP app: auth, health and Streamable HTTP ---
+
+INIT = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}},
+}
+MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+AUTH = {"Authorization": "Bearer test-secret-token"}
+
+
+@pytest.fixture
+def make_client(monkeypatch):
+    """Start the app (with lifespan) for a given auth token."""
+    from starlette.testclient import TestClient
+
+    import main
+
+    def make(token: str):
+        monkeypatch.setattr(main, "AUTH_TOKEN", token)
+        return TestClient(main.app, raise_server_exceptions=False)
+
+    return make
 
 
 class TestBearerAuth:
-    @pytest.fixture(autouse=True)
-    def _patch_token(self, monkeypatch):
-        monkeypatch.setattr("main.AUTH_TOKEN", "test-secret-token")
-
     @pytest.fixture
-    def client(self):
-        from starlette.testclient import TestClient
-
-        from main import app
-
-        return TestClient(app, raise_server_exceptions=False)
+    def client(self, make_client):
+        with make_client("test-secret-token") as c:
+            yield c
 
     def test_health_no_auth_required(self, client):
         resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.text == "ok"
 
-    def test_sse_rejected_without_token(self, client):
-        resp = client.get("/sse")
+    def test_healthz_no_auth_required(self, client):
+        resp = client.get("/healthz")
+        assert resp.status_code == 200
+        assert resp.text == "ok"
+
+    def test_healthz_check_requires_auth(self, client):
+        assert client.get("/healthz?check=1").status_code == 401
+
+    def test_mcp_rejected_without_token(self, client):
+        resp = client.post("/mcp", json=INIT, headers=MCP_HEADERS)
         assert resp.status_code == 401
         assert resp.text == "unauthorized"
 
-    def test_sse_rejected_with_wrong_token(self, client):
-        resp = client.get("/sse", headers={"Authorization": "Bearer wrong-token"})
+    def test_mcp_rejected_with_wrong_token(self, client):
+        resp = client.post("/mcp", json=INIT, headers={**MCP_HEADERS, "Authorization": "Bearer wrong-token"})
         assert resp.status_code == 401
 
-    def test_sse_rejected_with_malformed_header(self, client):
-        resp = client.get("/sse", headers={"Authorization": "Basic dXNlcjpwYXNz"})
+    def test_mcp_rejected_with_malformed_header(self, client):
+        resp = client.post("/mcp", json=INIT, headers={**MCP_HEADERS, "Authorization": "Basic dXNlcjpwYXNz"})
         assert resp.status_code == 401
 
-    def test_messages_rejected_without_token(self, client):
-        resp = client.post("/messages/")
-        assert resp.status_code == 401
+    def test_initialize_with_valid_token(self, client):
+        resp = client.post("/mcp", json=INIT, headers={**MCP_HEADERS, **AUTH})
+        assert resp.status_code == 200
+        assert resp.json()["result"]["serverInfo"]["name"] == "spond"
 
-    def test_accepted_with_valid_token(self, client):
-        # Test that valid token passes through middleware (not 401)
-        # Use /messages/ since /sse is a long-lived streaming endpoint
-        resp = client.post("/messages/", headers={"Authorization": "Bearer test-secret-token"})
-        assert resp.status_code != 401
+    def test_tools_list_without_session(self, client):
+        # Stateless: a request needs no session from an earlier initialize.
+        body = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        resp = client.post("/mcp", json=body, headers={**MCP_HEADERS, **AUTH})
+        assert resp.status_code == 200
+        names = {t["name"] for t in resp.json()["result"]["tools"]}
+        assert "get_upcoming_events" in names
+
+    def test_old_sse_endpoint_is_gone(self, client):
+        assert client.get("/sse", headers=AUTH).status_code == 404
 
 
 class TestBearerAuthDisabled:
     """When MCP_AUTH_TOKEN is empty, all requests pass through."""
 
-    @pytest.fixture(autouse=True)
-    def _patch_token(self, monkeypatch):
-        monkeypatch.setattr("main.AUTH_TOKEN", "")
-
     @pytest.fixture
-    def client(self):
-        from starlette.testclient import TestClient
+    def client(self, make_client):
+        with make_client("") as c:
+            yield c
 
-        from main import app
-
-        return TestClient(app, raise_server_exceptions=False)
-
-    def test_messages_allowed_without_token(self, client):
-        resp = client.post("/messages/")
-        assert resp.status_code != 401
+    def test_mcp_allowed_without_token(self, client):
+        resp = client.post("/mcp", json=INIT, headers=MCP_HEADERS)
+        assert resp.status_code == 200
 
     def test_health_still_works(self, client):
         resp = client.get("/health")
         assert resp.status_code == 200
+
+
+class TestHealthCheck:
+    @pytest.fixture
+    def client(self, make_client):
+        with make_client("") as c:
+            yield c
+
+    def test_missing_credentials(self, client, monkeypatch):
+        monkeypatch.delenv("SPOND_USERNAME", raising=False)
+        monkeypatch.delenv("SPOND_PASSWORD", raising=False)
+        resp = client.get("/healthz?check=1")
+        assert resp.status_code == 503
+        assert resp.json()["ok"] is False
+
+    def test_login_ok(self, client, monkeypatch, service):
+        monkeypatch.setenv("SPOND_USERNAME", "user@example.com")
+        monkeypatch.setenv("SPOND_PASSWORD", "synthetic")
+        monkeypatch.setattr("main.service", service)
+        resp = client.get("/healthz?check=1")
+        assert resp.status_code == 200
+        assert resp.json()["checks"][0] == {"name": "Login", "ok": True, "detail": "logged in, 3 groups"}
+
+    def test_login_failure_hides_details(self, client, monkeypatch, service):
+        monkeypatch.setenv("SPOND_USERNAME", "user@example.com")
+        monkeypatch.setenv("SPOND_PASSWORD", "synthetic")
+        service._client.get_groups.side_effect = RuntimeError("Login failed. Response received: secret")
+        monkeypatch.setattr("main.service", service)
+        resp = client.get("/healthz?check=1")
+        assert resp.status_code == 503
+        assert "secret" not in resp.text

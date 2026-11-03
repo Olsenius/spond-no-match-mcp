@@ -1,22 +1,24 @@
-"""Spond MCP server entry point — Starlette app with health + SSE endpoints."""
+"""Spond MCP server entry point — Starlette app with health + Streamable HTTP endpoints."""
 
+import contextlib
 import hmac
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
 
 import uvicorn
 from mcp.server import Server
-from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import TextContent, Tool
 from spond.spond import Spond
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, Response
-from starlette.routing import Mount, Route
+from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
 from server import TOOLS, SpondService, handle_tool_call
 
@@ -26,15 +28,21 @@ logger = logging.getLogger("spond-mcp")
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
 service: SpondService | None = None
+session_manager: StreamableHTTPSessionManager | None = None
+
+
+def is_public(request: Request) -> bool:
+    """Liveness probes need no auth; /healthz?check=1 runs real checks and does."""
+    if request.url.path == "/health":
+        return True
+    return request.url.path == "/healthz" and "check" not in request.query_params
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Validate Bearer token on all requests except /health."""
+    """Validate Bearer token on all requests except liveness probes."""
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
-            return await call_next(request)
-        if not AUTH_TOKEN:
+        if is_public(request) or not AUTH_TOKEN:
             return await call_next(request)
         auth = request.headers.get("authorization", "")
         if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], AUTH_TOKEN):
@@ -60,9 +68,15 @@ def create_service() -> SpondService:
     return SpondService(client=client, kids_config=kids_config)
 
 
+def get_service() -> SpondService:
+    global service
+    if service is None:
+        service = create_service()
+    return service
+
+
 # MCP server setup
 mcp_server = Server("spond")
-sse = SseServerTransport("/messages/")
 
 
 @mcp_server.list_tools()
@@ -72,11 +86,8 @@ async def list_tools() -> list[Tool]:
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
-    global service
-    if service is None:
-        service = create_service()
     try:
-        result = await handle_tool_call(service, name, arguments)
+        result = await handle_tool_call(get_service(), name, arguments)
     except Exception as e:
         logger.exception("Tool %s failed", name)
         result = f"Feil: {e}"
@@ -84,31 +95,57 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
 
 # HTTP handlers
-async def handle_sse(request: Request):
-    async with sse.connect_sse(request.scope, request.receive, request._send) as (
-        read_stream,
-        write_stream,
-    ):
-        await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
-    return Response()
+class MCPEndpoint:
+    """ASGI endpoint for /mcp that hands requests to the session manager."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if session_manager is None:
+            raise RuntimeError("session manager is not running")
+        await session_manager.handle_request(scope, receive, send)
 
 
 async def health(request: Request):
     return PlainTextResponse("ok")
 
 
-@asynccontextmanager
-async def lifespan(app):
-    yield
-    if service is not None:
-        await service.close()
+async def healthz(request: Request):
+    if "check" not in request.query_params:
+        return PlainTextResponse("ok")
+    checks = []
+    if not os.environ.get("SPOND_USERNAME") or not os.environ.get("SPOND_PASSWORD"):
+        checks.append({"name": "Login", "ok": False, "detail": "SPOND_USERNAME and SPOND_PASSWORD must be set"})
+    else:
+        try:
+            groups = await get_service().get_groups()
+            checks.append({"name": "Login", "ok": True, "detail": f"logged in, {len(groups or [])} groups"})
+        except Exception:
+            # The Spond library puts the raw login response in its errors; keep it out of the answer.
+            logger.exception("Health check failed")
+            checks.append({"name": "Login", "ok": False, "detail": "could not log in to Spond"})
+    ok = all(c["ok"] for c in checks)
+    body = {"ok": ok, "status": "ok" if ok else "error", "checks": checks}
+    return JSONResponse(body, status_code=200 if ok else 503)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app) -> AsyncIterator[None]:
+    global session_manager
+    # Stateless: each request stands alone, so any replica can serve it.
+    session_manager = StreamableHTTPSessionManager(app=mcp_server, stateless=True, json_response=True)
+    async with session_manager.run():
+        try:
+            yield
+        finally:
+            session_manager = None
+            if service is not None:
+                await service.close()
 
 
 app = Starlette(
     routes=[
         Route("/health", health),
-        Route("/sse", handle_sse),
-        Mount("/messages/", app=sse.handle_post_message),
+        Route("/healthz", healthz),
+        Route("/mcp", MCPEndpoint(), methods=["GET", "POST", "DELETE"]),
     ],
     middleware=[Middleware(BearerAuthMiddleware)],
     lifespan=lifespan,

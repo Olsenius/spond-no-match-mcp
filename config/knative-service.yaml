@@ -24,8 +24,6 @@ spec:
         - containerPort: 8080
           protocol: TCP
         env:
-        - name: BASE_URL
-          value: "https://spond.mcp.fn.flaatten.org"
         - name: SPOND_USERNAME
           valueFrom:
             secretKeyRef:
@@ -52,7 +50,7 @@ spec:
             cpu: "200m"
         livenessProbe:
           httpGet:
-            path: /health
+            path: /healthz
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 30
@@ -60,7 +58,7 @@ spec:
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /health
+            path: /healthz
             port: 8080
           initialDelaySeconds: 3
           periodSeconds: 10
