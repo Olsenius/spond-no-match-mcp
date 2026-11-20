@@ -2,6 +2,7 @@
 
 import logging
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -11,9 +12,11 @@ from conftest import (
     MOCK_EVENTS_FJORDVIK,
     MOCK_GROUPS,
     MOCK_POSTS,
+    MOCK_PROFILE,
 )
 from server import (
     TOOLS,
+    SpondSessionError,
     format_event_detail,
     format_event_summary,
     format_group_summary,
@@ -973,3 +976,53 @@ class TestHealthCheck:
         resp = client.get("/healthz?check=1")
         assert resp.status_code == 503
         assert "secret" not in resp.text
+
+
+# --- Expired Spond session ---
+
+
+class TestExpiredSession:
+    @pytest.mark.asyncio
+    async def test_error_body_logs_in_again(self, service):
+        service._client.token = "expired"
+        service._client.get_groups = AsyncMock(side_effect=[{"message": "Not authenticated"}, MOCK_GROUPS])
+        groups = await service.get_groups()
+        assert [g["id"] for g in groups] == [g["id"] for g in MOCK_GROUPS]
+        assert service._client.token is None
+        assert service._client.get_groups.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_not_logged_in_profile_logs_in_again(self, service):
+        service._client.get_profile = AsyncMock(
+            side_effect=[{"message": "User is not logged in.", "errorKey": "notLoggedIn"}, MOCK_PROFILE]
+        )
+        assert await service.get_profile_id() == MOCK_PROFILE["id"]
+
+    @pytest.mark.asyncio
+    async def test_401_error_logs_in_again(self, service):
+        service._client.get_posts = AsyncMock(
+            side_effect=[ValueError('Request failed with status 401: {"message":"Not authenticated"}'), []]
+        )
+        assert await service._call("get_posts", group_id="G") == []
+        assert service._client.get_posts.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_other_errors_are_not_retried(self, service):
+        service._client.get_posts = AsyncMock(side_effect=ValueError("Request failed with status 500: oops"))
+        with pytest.raises(ValueError, match="status 500"):
+            await service._call("get_posts", group_id="G")
+        service._client.get_posts.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_one_new_login(self, service):
+        service._client.get_groups = AsyncMock(return_value={"message": "Not authenticated"})
+        with pytest.raises(SpondSessionError):
+            await service._call("get_groups")
+        assert service._client.get_groups.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_normal_dict_results_pass_through(self, service):
+        result = {"acceptedIds": ["MEMBER_OLIVER"], "declinedIds": []}
+        service._client.change_response = AsyncMock(return_value=result)
+        assert await service._call("change_response", "E", "M", {}) == result
+        service._client.change_response.assert_awaited_once()

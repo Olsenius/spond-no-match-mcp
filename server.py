@@ -24,6 +24,27 @@ LOCATION_FIELDS = ("feature", "address", "latitude", "longitude")
 # Attributes where the Spond library keeps a raw copy of the last response.
 RAW_CLIENT_ATTRS = ("profile", "groups", "events", "posts", "messages")
 
+# Spond answers an expired or missing session with HTTP 401. Depending on the call,
+# the library either raises ValueError("Request failed with status 401: ...") or
+# returns the error body, such as {"message": "Not authenticated"}.
+UNAUTHENTICATED_MESSAGES = ("Not authenticated", "User is not logged in.")
+UNAUTHENTICATED_ERROR_KEYS = ("notLoggedIn",)
+SESSION_EXPIRED = object()
+
+
+class SpondSessionError(Exception):
+    """Spond kept rejecting the session after a fresh login."""
+
+
+def is_unauthenticated_response(result: Any) -> bool:
+    if not isinstance(result, dict) or "id" in result:
+        return False
+    return result.get("errorKey") in UNAUTHENTICATED_ERROR_KEYS or result.get("message") in UNAUTHENTICATED_MESSAGES
+
+
+def is_unauthenticated_error(error: ValueError) -> bool:
+    return "status 401" in str(error)
+
 
 def kid_display_name(member: dict) -> str:
     """Spond stores names differently per group ("Astrid" vs "Astrid Olsen"); use the first word."""
@@ -144,9 +165,31 @@ class SpondService:
         self._cache[key] = (data, time.monotonic())
 
     async def _call(self, operation: str, *args, **kwargs):
+        """Call the Spond library, logging in again once if the session has expired.
+
+        The library logs in only when it has no token and never renews it, so an
+        expired token makes every later call fail until the token is cleared.
+        """
+        result = await self._call_once(operation, *args, **kwargs)
+        if result is not SESSION_EXPIRED:
+            return result
+        logger.info("Spond session expired; logging in again")
+        self._client.token = None
+        result = await self._call_once(operation, *args, **kwargs)
+        if result is SESSION_EXPIRED:
+            raise SpondSessionError("Spond rejected the session after logging in again")
+        return result
+
+    async def _call_once(self, operation: str, *args, **kwargs):
         """Call the Spond library inside a client span named after the operation only."""
         with telemetry.span(f"spond {operation}", kind=SpanKind.CLIENT, attributes={"spond.operation": operation}):
-            return await getattr(self._client, operation)(*args, **kwargs)
+            try:
+                result = await getattr(self._client, operation)(*args, **kwargs)
+            except ValueError as e:
+                if is_unauthenticated_error(e):
+                    return SESSION_EXPIRED
+                raise
+            return SESSION_EXPIRED if is_unauthenticated_response(result) else result
 
     def _forget_raw(self) -> None:
         """Drop the raw copies the Spond library keeps of its last responses."""
