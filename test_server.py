@@ -5,6 +5,7 @@ import time
 from unittest.mock import AsyncMock
 
 import pytest
+from spond import AuthenticationError
 
 from conftest import (
     MOCK_EVENT_CANCELLED,
@@ -976,6 +977,28 @@ class TestHealthCheck:
         resp = client.get("/healthz?check=1")
         assert resp.status_code == 503
         assert "secret" not in resp.text
+
+    def test_failed_login_starts_a_new_service(self, client, monkeypatch, service):
+        import main
+
+        monkeypatch.setattr("main.settings", Settings(CREDENTIALS))
+        service._client.get_profile.side_effect = AuthenticationError("Login failed. Response received: secret")
+        monkeypatch.setattr("main.service", service)
+        assert client.get("/healthz?check=1").status_code == 503
+        assert main.service is None
+        service._client.clientsession.close.assert_awaited()
+
+
+class TestToolLoginFailure:
+    @pytest.mark.asyncio
+    async def test_failed_login_starts_a_new_service(self, monkeypatch, service):
+        import main
+
+        service._client.get_profile.side_effect = AuthenticationError("Login failed. Response received: secret")
+        monkeypatch.setattr("main.service", service)
+        result = await main.call_tool("list_groups", {})
+        assert "secret" not in result[0].text
+        assert main.service is None
 
 
 # --- Expired Spond session ---

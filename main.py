@@ -137,6 +137,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # The error message holds Spond's raw login response; keep it out of logs and answers.
             telemetry.mark_error(current, e)
             logger.error("Tool %s failed: Spond login failed", label)
+            # The library closes its HTTP session when login fails; start over on the next call.
+            await reset_service()
             result = "Feil: innlogging til Spond feilet. Sjekk SPOND_USERNAME og SPOND_PASSWORD."
         except Exception as e:
             telemetry.mark_error(current, e)
@@ -178,6 +180,8 @@ async def healthz(request: Request):
         except Exception as e:
             # The Spond library puts the raw login response in its errors; keep it out of logs and answers.
             logger.error("Health check failed: %s", type(e).__name__)
+            if isinstance(e, AuthenticationError):
+                await reset_service()
             checks.append({"name": "Login", "ok": False, "detail": "could not log in to Spond"})
         status = "ok" if checks[0]["ok"] else "failing"
     ok = all(c["ok"] for c in checks)
